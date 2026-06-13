@@ -69,7 +69,7 @@ claude login    # autenticar con tu cuenta de Claude Pro
 ## Instalación
 
 ```bash
-git clone https://github.com/TU_USUARIO/aurora-v1.git
+git clone https://github.com/ArchelKrozt/aurora_asistente_with_claude.git
 cd aurora-v1
 bash install.sh
 ```
