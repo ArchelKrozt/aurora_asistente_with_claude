@@ -1,0 +1,3154 @@
+#!/home/sandokant/.local/share/aurora/venv/bin/python3
+"""
+Aurora — Asistente IA Cyberpunk
+Backend: claude CLI (cuenta Pro) | UI: GTK3 con chat burbujas cyberpunk
+"""
+import gi
+gi.require_version('Gtk', '3.0')
+gi.require_version('Gdk', '3.0')
+
+try:
+    gi.require_version('AppIndicator3', '0.1')
+    from gi.repository import AppIndicator3
+    HAS_INDICATOR = True
+except (ValueError, ImportError):
+    HAS_INDICATOR = False
+
+from gi.repository import Gtk, Gdk, GLib, Pango, GdkPixbuf
+try:
+    gi.require_version('Notify', '0.7')
+    from gi.repository import Notify as GNotify
+    GNotify.init('Aurora')
+    HAS_NOTIFY = True
+except Exception:
+    HAS_NOTIFY = False
+import cairo
+import json, os, subprocess, threading, shutil, math, io, base64, tempfile, time, shlex, random
+from datetime import datetime
+from pathlib import Path
+from PIL import Image, ImageFilter
+import psutil
+
+try:
+    from Xlib import X, XK
+    from Xlib import display as Xdisplay
+    HAS_XLIB = True
+except ImportError:
+    HAS_XLIB = False
+
+# ── Rutas ──────────────────────────────────────────────────────────────
+DATA  = Path.home() / '.local/share/aurora'
+CONVS = DATA / 'conversations'
+CFG   = DATA / 'config.json'
+ICON  = DATA / 'aurora.svg'
+AI_AVATAR   = DATA / 'aurora_avatar.svg'
+USER_AVATAR = DATA / 'user_avatar.png'
+for d in (DATA, CONVS): d.mkdir(parents=True, exist_ok=True)
+
+# ── Paleta base ────────────────────────────────────────────────────────
+C_YELLOW = '#fcee09'
+C_RED    = '#FF003C'
+C_CYAN   = '#00e5ff'
+C_BG     = '#07060e'
+
+
+def find_claude() -> str | None:
+    c = shutil.which('claude')
+    if c: return c
+    nvm = Path.home() / '.nvm'
+    if nvm.exists():
+        for p in sorted(nvm.glob('versions/node/*/bin/claude'), reverse=True):
+            if p.is_file(): return str(p)
+    for p in [Path.home() / '.npm-global/bin/claude',
+               Path('/usr/local/bin/claude')]:
+        if p.is_file(): return str(p)
+    return None
+
+CLAUDE_BIN = find_claude()
+
+
+def _ext_path() -> str:
+    extra = []
+    nvm = Path.home() / '.nvm'
+    if nvm.exists():
+        for p in sorted(nvm.glob('versions/node/*/bin'), reverse=True):
+            extra.append(str(p))
+    extra += [str(Path.home() / '.npm-global/bin'),
+              str(Path.home() / '.local/bin'),
+              '/usr/local/bin', '/usr/bin', '/bin']
+    return ':'.join(extra + [os.environ.get('PATH', '')])
+
+
+# ══════════════════════════════════════════════════════════════════════
+#  Config
+# ══════════════════════════════════════════════════════════════════════
+DEFAULTS = {
+    'model':                None,
+    'aurora_name':          'Aurora',
+    'user_name':            'Tú',
+    'personality':          (
+        'Tu nombre en esta interfaz es Aurora. Eres cálida, directa y precisa. '
+        'Ocasionalmente usas terminología con sabor cyberpunk pero sin exagerar. '
+        'Respuestas concisas salvo que se necesite profundidad. '
+        'Código siempre en bloques markdown.'),
+    'aurora_avatar':        str(AI_AVATAR),
+    'user_avatar':          None,
+    'font_size':            13,
+    'anim_speed':           4,
+    'window_opacity':       90,
+    'accent':               C_YELLOW,
+    'show_timestamp':       True,
+    'accounts':             [],
+    'current_account_idx':  0,
+    'auto_failover':        True,
+    # ── Integraciones del sistema ──
+    'hotkey_enabled':       True,
+    'hotkey':               'ctrl+alt+space',
+    'clipboard_monitor':    True,
+    'clipboard_min_chars':  80,
+    'screenshot_enabled':   True,
+    'dragdrop_enabled':     True,
+    # ── UI & Productividad ──
+    'show_sysmon':          True,   # stats CPU/RAM en header
+    'notifications':        True,   # notificaciones de escritorio
+    'boot_animation':       True,   # animación de arranque
+    'export_dir':           str(Path.home() / 'Documents'),
+    # ── Capacidades IA ──
+    'slash_commands':       [],   # lista personalizada; vacío = usar DEFAULT_COMMANDS
+    'terminal_confirm':     True, # pedir confirmación antes de ejecutar /run
+}
+
+# ── Slash commands por defecto ──────────────────────────────────────────
+DEFAULT_COMMANDS = [
+    {'trigger': 'debug',
+     'label':   '/debug     — Encuentra bugs en el código',
+     'prompt':  'Analiza este código, encuentra todos los bugs y explica cada problema con su solución:\n\n'},
+    {'trigger': 'explica',
+     'label':   '/explica   — Explica el código',
+     'prompt':  'Explica este código de forma clara y detallada:\n\n'},
+    {'trigger': 'refactor',
+     'label':   '/refactor  — Refactoriza el código',
+     'prompt':  'Refactoriza este código mejorando legibilidad, performance y mantenibilidad:\n\n'},
+    {'trigger': 'test',
+     'label':   '/test      — Genera tests',
+     'prompt':  'Escribe tests completos y bien estructurados para este código:\n\n'},
+    {'trigger': 'doc',
+     'label':   '/doc       — Genera documentación',
+     'prompt':  'Genera documentación completa (docstrings, comentarios) para:\n\n'},
+    {'trigger': 'commit',
+     'label':   '/commit    — Mensaje de commit git',
+     'prompt':  'Genera un mensaje de commit en formato "tipo(scope): descripción" para estos cambios:\n\n'},
+    {'trigger': 'traduce',
+     'label':   '/traduce   — Traduce al español',
+     'prompt':  'Traduce al español de forma natural:\n\n'},
+    {'trigger': 'resume',
+     'label':   '/resume    — Haz un resumen',
+     'prompt':  'Haz un resumen conciso y estructurado de:\n\n'},
+    {'trigger': 'sql',
+     'label':   '/sql       — Optimiza y explica SQL',
+     'prompt':  'Optimiza esta query SQL y explica qué hace y cómo mejorarla:\n\n'},
+    {'trigger': 'seguridad',
+     'label':   '/seguridad — Analiza vulnerabilidades',
+     'prompt':  'Analiza este código en busca de vulnerabilidades de seguridad (OWASP, injections, etc.):\n\n'},
+    {'trigger': 'run',
+     'label':   '/run       — Ejecutar comando en terminal',
+     'prompt':  '__TERMINAL__'},
+    {'trigger': 'sudo',
+     'label':   '/sudo      — Ejecutar comando con sudo',
+     'prompt':  '__SUDO__'},
+]
+
+def get_commands(cfg) -> list:
+    custom = cfg.get('slash_commands', [])
+    return custom if custom else DEFAULT_COMMANDS
+
+
+# ══════════════════════════════════════════════════════════════════════
+#  SudoManager — credenciales con caché de 5 minutos
+# ══════════════════════════════════════════════════════════════════════
+_SUDO_NOPASSWD_FILE = '/etc/sudoers.d/aurora-sandokant'
+_SUDO_USER          = os.environ.get('USER', 'sandokant')
+_SUDO_SETUP_CMD     = (
+    f'echo "{_SUDO_USER} ALL=(ALL) NOPASSWD: ALL" '
+    f'| sudo tee {_SUDO_NOPASSWD_FILE} '
+    f'&& sudo chmod 440 {_SUDO_NOPASSWD_FILE}')
+
+
+class SudoManager:
+    def __init__(self):
+        self._lock = threading.Lock()
+
+    def is_nopasswd(self) -> bool:
+        """Verifica si NOPASSWD está configurado (sin prompt)."""
+        r = subprocess.run(['sudo', '-n', 'true'],
+                           capture_output=True, timeout=5)
+        return r.returncode == 0
+
+    def run(self, cmd: str, env: dict | None = None) -> tuple[str, int]:
+        """Ejecuta cmd con sudo -n (requiere NOPASSWD configurado)."""
+        run_env = {**os.environ, 'PATH': _ext_path(), **(env or {})}
+        proc = subprocess.run(
+            f'sudo -n -- {cmd}',
+            shell=True, capture_output=True, text=True,
+            timeout=60, env=run_env)
+        return (proc.stdout + proc.stderr).strip(), proc.returncode
+
+    def invalidate(self):
+        pass   # con NOPASSWD ya no hay caché que manejar
+
+
+SUDO_MGR = SudoManager()
+
+# ── Gestión de cuentas ─────────────────────────────────────────────────
+ACCOUNTS_DIR = DATA / 'accounts'
+ACCOUNTS_DIR.mkdir(exist_ok=True)
+
+RATE_LIMIT_KEYWORDS = (
+    'rate limit', 'quota', 'usage limit', 'too many requests',
+    'overloaded', 'insufficient credits', '429', '529',
+    'credit balance', 'billing', 'token limit',
+)
+
+def _is_rate_limit(msg: str) -> bool:
+    m = msg.lower()
+    return any(k in m for k in RATE_LIMIT_KEYWORDS)
+
+def read_account_creds(claude_dir: str) -> dict:
+    """Lee credenciales de un directorio CLAUDE_CONFIG_DIR."""
+    creds_path = Path(claude_dir) / '.credentials.json'
+    if not creds_path.exists():
+        return {}
+    try:
+        d = json.loads(creds_path.read_text())
+        oauth = d.get('claudeAiOauth', {})
+        return {
+            'plan':  oauth.get('subscriptionType', '?'),
+            'tier':  oauth.get('rateLimitTier', '?'),
+            'valid': bool(oauth.get('accessToken')),
+        }
+    except Exception:
+        return {}
+
+def default_accounts() -> list:
+    """Crea la entrada de cuenta principal desde ~/.claude por defecto."""
+    main_dir = str(Path.home() / '.claude')
+    creds = read_account_creds(main_dir)
+    return [{
+        'id':            'main',
+        'label':         'Cuenta principal',
+        'claude_dir':    main_dir,
+        'plan':          creds.get('plan', 'pro'),
+        'enabled':       True,
+        'depleted_until': None,
+    }]
+
+class Config:
+    def __init__(self):
+        self._d = dict(DEFAULTS)
+        if CFG.exists():
+            try: self._d.update(json.loads(CFG.read_text()))
+            except: pass
+
+    def get(self, k, default=None):
+        return self._d.get(k, DEFAULTS.get(k, default))
+
+    def set(self, k, v):
+        self._d[k] = v
+        CFG.write_text(json.dumps(self._d, indent=2))
+
+    def save_all(self, d: dict):
+        self._d.update(d)
+        CFG.write_text(json.dumps(self._d, indent=2))
+
+
+# ══════════════════════════════════════════════════════════════════════
+#  Conversation
+# ══════════════════════════════════════════════════════════════════════
+class Conversation:
+    def __init__(self, cid=None):
+        self.id         = cid or datetime.now().strftime('%Y%m%d_%H%M%S_%f')
+        self.messages   = []
+        self.title      = 'Nueva conversación'
+        self.created    = datetime.now().isoformat()
+        self.session_id = None
+        self._path      = CONVS / f'{self.id}.json'
+        if cid and self._path.exists():
+            try:
+                d = json.loads(self._path.read_text())
+                self.messages   = d.get('messages', [])
+                self.title      = d.get('title', self.title)
+                self.created    = d.get('created', self.created)
+                self.session_id = d.get('session_id')
+            except: pass
+
+    def save(self):
+        self._path.write_text(json.dumps({
+            'id':         self.id, 'title':      self.title,
+            'created':    self.created,
+            'session_id': self.session_id, 'messages': self.messages,
+        }, indent=2, ensure_ascii=False))
+
+    def add(self, role, content):
+        self.messages.append({'role': role, 'content': content})
+        if len(self.messages) == 2:
+            self.title = self.messages[0]['content'][:55]
+        self.save()
+
+    @staticmethod
+    def list_all():
+        out = []
+        for f in sorted(CONVS.glob('*.json'), reverse=True):
+            try:
+                d = json.loads(f.read_text())
+                out.append({'id':      d.get('id', f.stem),
+                            'title':   d.get('title', '—'),
+                            'created': d.get('created', '')})
+            except: pass
+        return out
+
+    @staticmethod
+    def delete(cid: str):
+        p = CONVS / f'{cid}.json'
+        if p.exists():
+            p.unlink()
+
+    @staticmethod
+    def rename(cid: str, new_title: str):
+        p = CONVS / f'{cid}.json'
+        if p.exists():
+            d = json.loads(p.read_text())
+            d['title'] = new_title
+            p.write_text(json.dumps(d, indent=2, ensure_ascii=False))
+
+
+# ══════════════════════════════════════════════════════════════════════
+#  Avatares circulares via Cairo
+# ══════════════════════════════════════════════════════════════════════
+def _make_circular_pixbuf(path: str | None, size: int = 36) -> GdkPixbuf.Pixbuf | None:
+    """Carga imagen y aplica clip circular con Cairo."""
+    try:
+        surf = cairo.ImageSurface(cairo.FORMAT_ARGB32, size, size)
+        ctx  = cairo.Context(surf)
+        ctx.arc(size / 2, size / 2, size / 2, 0, 2 * math.pi)
+        ctx.clip()
+        pb = GdkPixbuf.Pixbuf.new_from_file_at_size(path, size, size)
+        Gdk.cairo_set_source_pixbuf(ctx, pb, 0, 0)
+        ctx.paint()
+        return Gdk.pixbuf_get_from_surface(surf, 0, 0, size, size)
+    except Exception:
+        return None
+
+def _default_pixbuf(color: str, size: int = 36, letter: str = '?') -> GdkPixbuf.Pixbuf:
+    """Avatar por defecto con inicial."""
+    surf = cairo.ImageSurface(cairo.FORMAT_ARGB32, size, size)
+    ctx  = cairo.Context(surf)
+    ctx.arc(size / 2, size / 2, size / 2, 0, 2 * math.pi)
+    ctx.clip()
+    # Fondo
+    ctx.set_source_rgba(0.04, 0.03, 0.09, 0.95)
+    ctx.paint()
+    # Borde
+    def hex2rgb(h):
+        h = h.lstrip('#')
+        return tuple(int(h[i:i+2], 16) / 255 for i in (0, 2, 4))
+    r, g, b = hex2rgb(color)
+    ctx.set_source_rgba(r, g, b, 0.8)
+    ctx.set_line_width(2)
+    ctx.arc(size / 2, size / 2, size / 2 - 1, 0, 2 * math.pi)
+    ctx.stroke()
+    # Letra
+    ctx.set_source_rgba(r, g, b, 1)
+    ctx.select_font_face('Monospace', cairo.FONT_SLANT_NORMAL, cairo.FONT_WEIGHT_BOLD)
+    ctx.set_font_size(size * 0.44)
+    te = ctx.text_extents(letter)
+    ctx.move_to(size / 2 - te.width / 2 - te.x_bearing,
+                size / 2 - te.height / 2 - te.y_bearing)
+    ctx.show_text(letter)
+    return Gdk.pixbuf_get_from_surface(surf, 0, 0, size, size)
+
+def load_pixbufs(cfg: Config):
+    ai_path   = cfg.get('aurora_avatar')
+    user_path = cfg.get('user_avatar')
+    ai_pb   = (_make_circular_pixbuf(ai_path, 36)
+                if ai_path and Path(ai_path).exists() else None)
+    user_pb = (_make_circular_pixbuf(user_path, 36)
+                if user_path and Path(user_path).exists() else None)
+    if not ai_pb:
+        ai_pb   = _default_pixbuf(C_RED,    36, 'A')
+    if not user_pb:
+        user_name = cfg.get('user_name', 'Tú')
+        user_pb = _default_pixbuf(C_YELLOW, 36, user_name[0].upper())
+    return ai_pb, user_pb
+
+
+# ══════════════════════════════════════════════════════════════════════
+#  CSS dinámico
+# ══════════════════════════════════════════════════════════════════════
+def build_css(cfg: Config) -> bytes:
+    acc   = cfg.get('accent', C_YELLOW)
+    op    = cfg.get('window_opacity', 90) / 100
+    fs    = cfg.get('font_size', 13)
+
+    def hex2rgba(h, a):
+        h = h.lstrip('#')
+        r, g, b = (int(h[i:i+2], 16) for i in (0, 2, 4))
+        return f'rgba({r},{g},{b},{a})'
+
+    acc_lo  = hex2rgba(acc, 0.08)
+    acc_mid = hex2rgba(acc, 0.22)
+    acc_hi  = hex2rgba(acc, 0.55)
+    acc_bdr = hex2rgba(acc, 0.35)
+    red_lo  = hex2rgba(C_RED, 0.08)
+    red_bdr = hex2rgba(C_RED, 0.5)
+    bg_win  = f'rgba(6,5,20,{op})'
+
+    return f"""
+/* ─── AURORA CYBERPUNK UI ─── */
+
+.aurora-win {{
+  background-color: transparent;
+  border: 1px solid {acc_bdr};
+  border-radius: 10px;
+}}
+
+/* Header */
+.aurora-header {{
+  background: linear-gradient(180deg,rgba(12,9,28,0.97) 0%,rgba(8,6,20,0.95) 100%);
+  border-bottom: 1px solid {acc_bdr};
+  padding: 8px 14px;
+  border-radius: 10px 10px 0 0;
+}}
+.aurora-title {{
+  color: {acc};
+  font-weight: bold;
+  font-size: 15px;
+  letter-spacing: 4px;
+}}
+.aurora-sub {{
+  color: {hex2rgba(acc, 0.38)};
+  font-size: 9px;
+  letter-spacing: 2px;
+}}
+
+/* Chat area */
+.chat-scroll, .chat-scroll viewport, .chat-box {{
+  background-color: transparent;
+}}
+
+/* Bubbles */
+.bubble-ai {{
+  background-color: {red_lo};
+  border-left: 2px solid {red_bdr};
+  border-radius: 0 8px 8px 8px;
+  padding: 2px;
+}}
+.bubble-user {{
+  background-color: {acc_lo};
+  border-right: 2px solid {acc_bdr};
+  border-radius: 8px 0 8px 8px;
+  padding: 2px;
+}}
+.bubble-text {{
+  background-color: transparent;
+  color: #dcdce4;
+  font-size: {fs}px;
+}}
+.bubble-text text {{
+  background-color: transparent;
+  color: #dcdce4;
+  font-size: {fs}px;
+}}
+.name-ai {{
+  color: {hex2rgba(C_RED, 0.8)};
+  font-size: 10px;
+  font-weight: bold;
+  letter-spacing: 1px;
+  padding-left: 4px;
+}}
+.name-user {{
+  color: {hex2rgba(acc, 0.7)};
+  font-size: 10px;
+  font-weight: bold;
+  letter-spacing: 1px;
+  padding-right: 4px;
+}}
+.ts-lbl {{
+  color: rgba(180,180,200,0.3);
+  font-size: 9px;
+  padding-left: 4px;
+  padding-right: 4px;
+}}
+
+/* Typing indicator */
+.typing-dot {{
+  background-color: {acc};
+  border-radius: 3px;
+}}
+
+/* Input area */
+.aurora-input-wrap {{
+  background-color: rgba(6,5,20,0.96);
+  border-top: 1px solid {hex2rgba(acc, 0.18)};
+  padding: 8px 10px;
+  border-radius: 0 0 10px 10px;
+}}
+.aurora-input {{
+  background-color: {acc_lo};
+  border: 1px solid {hex2rgba(acc, 0.25)};
+  border-radius: 6px;
+  color: #e9e9ed;
+  caret-color: {acc};
+  padding: 6px 10px;
+  font-size: {fs}px;
+}}
+.aurora-input:focus {{ border-color: {acc_hi}; }}
+.aurora-input text {{ background-color: transparent; color: #e9e9ed; }}
+
+/* Buttons */
+.aurora-btn-send {{
+  background-color: {acc_mid};
+  border: 1px solid {acc_bdr};
+  border-radius: 6px;
+  color: {acc};
+  font-weight: bold;
+  font-size: 13px;
+  padding: 6px 16px;
+  min-width: 72px;
+  transition: all 120ms;
+}}
+.aurora-btn-send:hover {{ background-color: {hex2rgba(acc, 0.32)}; }}
+.aurora-btn-send:disabled {{ opacity: 0.3; }}
+.aurora-btn-sm {{
+  background-color: transparent;
+  border: 1px solid {hex2rgba(acc, 0.20)};
+  border-radius: 4px;
+  color: {hex2rgba(acc, 0.58)};
+  font-size: 11px;
+  padding: 3px 10px;
+  transition: all 100ms;
+}}
+.aurora-btn-sm:hover {{
+  border-color: {acc_hi};
+  color: {acc};
+  background-color: {acc_lo};
+}}
+
+/* Status */
+.aurora-status {{
+  color: {hex2rgba(acc, 0.4)};
+  font-size: 10px;
+  font-style: italic;
+  padding: 2px 12px;
+}}
+
+/* Scrollbar */
+scrollbar {{ background-color: transparent; }}
+scrollbar slider {{
+  background-color: {hex2rgba(acc, 0.15)};
+  border-radius: 4px;
+  min-width: 4px; min-height: 4px;
+}}
+scrollbar slider:hover {{ background-color: {hex2rgba(acc, 0.35)}; }}
+
+/* History/settings dialogs */
+.dlg-row {{ padding: 4px 8px; }}
+.dlg-title {{
+  color: {acc};
+  font-weight: bold;
+  font-size: 11px;
+  letter-spacing: 1px;
+}}
+.dlg-sub {{ color: rgba(180,180,200,0.55); font-size: 10px; }}
+
+/* ─── Bloques de código enriquecidos ─── */
+.code-block-outer {{
+  background-color: rgba(8,6,22,0.92);
+  border: 1px solid {hex2rgba(acc, 0.25)};
+  border-radius: 6px;
+  margin: 2px 4px;
+}}
+.code-block-tv {{
+  background-color: transparent;
+  color: {acc};
+  font-family: Monospace;
+  font-size: {fs - 1}px;
+}}
+.code-block-tv text {{ background-color: transparent; color: {acc}; }}
+.code-lang-lbl {{
+  color: {hex2rgba(acc, 0.45)};
+  font-size: 9px;
+  font-weight: bold;
+  letter-spacing: 2px;
+}}
+
+/* ─── Slash command popup ─── */
+.slash-popup {{
+  background-color: rgba(8,6,22,0.97);
+  border: 1px solid {acc_bdr};
+  border-radius: 6px;
+}}
+.slash-row {{
+  padding: 5px 10px;
+  color: rgba(200,200,220,0.85);
+  font-size: 12px;
+  font-family: Monospace;
+}}
+.slash-row:selected {{
+  background-color: {acc_lo};
+  color: {acc};
+}}
+
+/* ─── Terminal output ─── */
+.terminal-bubble {{
+  background-color: rgba(0,0,0,0.88);
+  border-left: 2px solid #00e5ff;
+  border-radius: 0 6px 6px 6px;
+  padding: 2px;
+}}
+.terminal-tv {{
+  background-color: transparent;
+  color: #00e5ff;
+  font-family: Monospace;
+  font-size: {fs - 1}px;
+}}
+.terminal-tv text {{ background-color: transparent; color: #00e5ff; }}
+
+/* ─── Sudo password dialog ─── */
+.sudo-entry {{
+  background-color: rgba(6,5,20,0.95);
+  border: 1px solid {hex2rgba(C_RED, 0.55)};
+  border-radius: 5px;
+  color: #e9e9ed;
+  caret-color: {C_RED};
+  font-family: Monospace;
+  padding: 6px 10px;
+}}
+.sudo-entry text {{ background-color: transparent; color: #e9e9ed; }}
+.sudo-entry:focus {{ border-color: {C_RED}; }}
+.sudo-title {{
+  color: {C_RED};
+  font-weight: bold;
+  font-size: 13px;
+  letter-spacing: 3px;
+}}
+
+/* ─── Stats del sistema (sysmon) ─── */
+.sysmon-bar {{
+  background-color: rgba(6,5,20,0.0);
+  border-top: 1px solid {hex2rgba(acc, 0.12)};
+  padding: 1px 10px;
+}}
+.sysmon-lbl {{
+  color: {hex2rgba(acc, 0.40)};
+  font-size: 9px;
+  font-family: Monospace;
+  letter-spacing: 1px;
+}}
+
+/* ─── Boot animation ─── */
+.boot-overlay {{
+  background-color: rgba(0,0,0,0.97);
+}}
+.boot-tv {{
+  background-color: transparent;
+  color: {acc};
+  font-family: Monospace;
+  font-size: 11px;
+}}
+.boot-tv text {{ background-color: transparent; color: {acc}; }}
+
+/* ─── Barra compactación ─── */
+.compact-bar {{
+  background-color: rgba(0,0,0,0.0);
+  padding: 4px 10px 4px 10px;
+}}
+.compact-lbl {{
+  color: {acc};
+  font-family: Monospace;
+  font-size: 10px;
+  letter-spacing: 2px;
+}}
+.compact-track {{
+  background-color: {hex2rgba(acc, 0.12)};
+  border: 1px solid {hex2rgba(acc, 0.30)};
+  border-radius: 3px;
+  min-height: 6px;
+}}
+.compact-fill {{
+  background-color: {acc};
+  border-radius: 3px;
+  min-height: 6px;
+}}
+
+/* ─── Mini mode ─── */
+.aurora-mini {{
+  background-color: rgba(6,5,20,0.94);
+  border: 1px solid {acc_bdr};
+  border-radius: 8px;
+}}
+
+/* ─── Historial: botones hover ─── */
+.hist-action-btn {{
+  background: rgba(0,0,0,0);
+  border: 1px solid {hex2rgba(acc, 0.35)};
+  border-radius: 4px;
+  color: {hex2rgba(acc, 0.75)};
+  font-size: 11px;
+  padding: 1px 6px;
+  min-width: 0;
+  min-height: 0;
+}}
+.hist-action-btn:hover {{
+  background: {hex2rgba(acc, 0.15)};
+  color: {acc};
+  border-color: {acc};
+}}
+.hist-del-btn {{
+  border-color: {hex2rgba(C_RED, 0.35)};
+  color: {hex2rgba(C_RED, 0.7)};
+}}
+.hist-del-btn:hover {{
+  background: rgba(255,50,50,0.12);
+  color: #ff5555;
+  border-color: #ff5555;
+}}
+
+/* ─── Search bar ─── */
+.search-entry {{
+  background-color: {acc_lo};
+  border: 1px solid {hex2rgba(acc, 0.25)};
+  border-radius: 5px;
+  color: #e9e9ed;
+  font-size: 12px;
+  padding: 4px 8px;
+}}
+.search-entry text {{ background-color: transparent; color: #e9e9ed; }}
+""".encode()
+
+ICON_SVG = """\
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 22 22">
+  <rect width="22" height="22" rx="3" fill="#070612"/>
+  <line x1="11" y1="3"  x2="4"  y2="19" stroke="#fcee09" stroke-width="2"   stroke-linecap="round"/>
+  <line x1="11" y1="3"  x2="18" y2="19" stroke="#fcee09" stroke-width="2"   stroke-linecap="round"/>
+  <line x1="6.8" y1="13" x2="15.2" y2="13" stroke="#fcee09" stroke-width="1.8" stroke-linecap="round"/>
+</svg>"""
+
+
+# ══════════════════════════════════════════════════════════════════════
+#  Helpers UI
+# ══════════════════════════════════════════════════════════════════════
+def _avatar_widget(pb: GdkPixbuf.Pixbuf) -> Gtk.Image:
+    img = Gtk.Image.new_from_pixbuf(pb)
+    img.set_valign(Gtk.Align.START)
+    img.set_margin_top(2)
+    return img
+
+
+def _parse_segments(text: str) -> list:
+    """Divide texto en segmentos ('text'|'code', contenido, lang)."""
+    segments = []
+    parts    = text.split('```')
+    in_code  = False
+    for part in parts:
+        if in_code:
+            lines = part.split('\n', 1)
+            lang  = lines[0].strip() if lines else ''
+            code  = lines[1].rstrip('\n') if len(lines) > 1 else ''
+            if code:
+                segments.append(('code', code, lang))
+        else:
+            if part.strip():
+                segments.append(('text', part))
+        in_code = not in_code
+    return segments or [('text', text)]
+
+
+def _make_code_block_widget(code: str, lang: str) -> Gtk.Widget:
+    """Widget enriquecido para un bloque de código con botón Copiar."""
+    outer = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=0)
+
+    # ── Header: lenguaje + botón copiar ──
+    hdr = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=4)
+    hdr.set_margin_start(6); hdr.set_margin_end(6)
+    hdr.set_margin_top(4);   hdr.set_margin_bottom(3)
+
+    lang_lbl = Gtk.Label(label=(lang or 'código').upper())
+    lang_lbl.get_style_context().add_class('code-lang-lbl')
+    hdr.pack_start(lang_lbl, True, True, 0)
+
+    copy_btn = Gtk.Button(label='Copiar')
+    copy_btn.get_style_context().add_class('aurora-btn-sm')
+    def on_copy(b, c=code):
+        Gtk.Clipboard.get(Gdk.SELECTION_CLIPBOARD).set_text(c, -1)
+        b.set_label('✔ Copiado')
+        GLib.timeout_add(1800, lambda: b.set_label('Copiar') or False)
+    copy_btn.connect('clicked', on_copy)
+    hdr.pack_start(copy_btn, False, False, 0)
+    outer.pack_start(hdr, False, False, 0)
+
+    # ── Separador ──
+    outer.pack_start(Gtk.Separator(), False, False, 0)
+
+    # ── Código ──
+    tv = Gtk.TextView()
+    tv.set_editable(False)
+    tv.set_cursor_visible(False)
+    tv.set_wrap_mode(Gtk.WrapMode.NONE)
+    tv.set_left_margin(8); tv.set_right_margin(8)
+    tv.set_top_margin(6);  tv.set_bottom_margin(6)
+    tv.get_style_context().add_class('code-block-tv')
+    tv.get_buffer().set_text(code)
+
+    sc = Gtk.ScrolledWindow()
+    sc.set_policy(Gtk.PolicyType.AUTOMATIC, Gtk.PolicyType.NEVER)
+    sc.add(tv)
+    outer.pack_start(sc, True, True, 0)
+    return outer
+
+
+def _make_rich_bubble_content(text: str, cfg: Config) -> Gtk.Widget:
+    """
+    Construye contenido de burbuja con bloques de código enriquecidos.
+    Retorna un Frame (texto simple) o VBox (contenido mixto).
+    """
+    segments = _parse_segments(text)
+    has_code = any(s[0] == 'code' for s in segments)
+
+    if not has_code:
+        # Sin código: un solo TextView como antes
+        tv = Gtk.TextView()
+        tv.set_editable(False); tv.set_cursor_visible(False)
+        tv.set_wrap_mode(Gtk.WrapMode.WORD_CHAR)
+        tv.set_left_margin(10); tv.set_right_margin(10)
+        tv.set_top_margin(7);   tv.set_bottom_margin(7)
+        tv.get_style_context().add_class('bubble-text')
+        buf = tv.get_buffer()
+        _setup_bubble_tags(buf)
+        buf.insert_with_tags_by_name(buf.get_end_iter(), text, 'normal')
+        frame = Gtk.Frame(); frame.set_shadow_type(Gtk.ShadowType.NONE)
+        frame.add(tv)
+        return frame
+
+    box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=4)
+    box.set_margin_top(4); box.set_margin_bottom(4)
+
+    for kind, content, *rest in segments:
+        if kind == 'text':
+            tv = Gtk.TextView()
+            tv.set_editable(False); tv.set_cursor_visible(False)
+            tv.set_wrap_mode(Gtk.WrapMode.WORD_CHAR)
+            tv.set_left_margin(10); tv.set_right_margin(10)
+            tv.set_top_margin(4);   tv.set_bottom_margin(4)
+            tv.get_style_context().add_class('bubble-text')
+            buf = tv.get_buffer()
+            _setup_bubble_tags(buf)
+            buf.insert_with_tags_by_name(buf.get_end_iter(), content, 'normal')
+            frame = Gtk.Frame(); frame.set_shadow_type(Gtk.ShadowType.NONE)
+            frame.add(tv)
+            box.pack_start(frame, False, False, 0)
+        else:
+            lang = rest[0] if rest else ''
+            cb   = _make_code_block_widget(content, lang)
+            cb.get_style_context().add_class('code-block-outer')
+            box.pack_start(cb, False, False, 0)
+    return box
+
+
+def _make_bubble_tv(cfg: Config) -> tuple[Gtk.Frame, Gtk.TextView]:
+    """Devuelve (frame, textview) para streaming (antes de finalizar)."""
+    tv = Gtk.TextView()
+    tv.set_editable(False)
+    tv.set_cursor_visible(False)
+    tv.set_wrap_mode(Gtk.WrapMode.WORD_CHAR)
+    tv.set_left_margin(10)
+    tv.set_right_margin(10)
+    tv.set_top_margin(7)
+    tv.set_bottom_margin(7)
+    tv.get_style_context().add_class('bubble-text')
+    frame = Gtk.Frame()
+    frame.set_shadow_type(Gtk.ShadowType.NONE)
+    frame.add(tv)
+    return frame, tv
+
+
+def _setup_bubble_tags(buf: Gtk.TextBuffer):
+    buf.create_tag('normal', foreground='#dcdce4')
+    buf.create_tag('code',   foreground='#fcee09', background='#0e0c20',
+                   family='Monospace', left_margin=4, right_margin=4,
+                   pixels_above_lines=2, pixels_below_lines=2)
+    buf.create_tag('bold',   foreground='#ffffff', weight=Pango.Weight.BOLD)
+
+
+def _fill_bubble(buf: Gtk.TextBuffer, text: str):
+    """Inserta texto en el buffer diferenciando bloques de código."""
+    buf.set_text('')
+    end = buf.get_end_iter
+    parts = text.split('```')
+    in_code = False
+    for part in parts:
+        if in_code:
+            lines = part.split('\n', 1)
+            body  = lines[1] if len(lines) > 1 else part
+            if body:
+                buf.insert_with_tags_by_name(end(), body, 'code')
+        else:
+            if part:
+                buf.insert_with_tags_by_name(end(), part, 'normal')
+        in_code = not in_code
+
+
+def _make_message_row(role: str, text: str, cfg: Config,
+                      ai_pb: GdkPixbuf.Pixbuf,
+                      user_pb: GdkPixbuf.Pixbuf,
+                      streaming: bool = False) -> tuple[Gtk.Box, Gtk.TextView | None]:
+    """
+    Construye una fila de mensaje completa.
+    Retorna (row_widget, textview_or_None).
+    textview es None si no es streaming.
+    """
+    is_ai   = (role == 'assistant')
+    acc_col = cfg.get('accent', C_YELLOW)
+    show_ts = cfg.get('show_timestamp', True)
+    name    = (cfg.get('aurora_name', 'Aurora') if is_ai
+               else cfg.get('user_name', 'Tú'))
+
+    row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
+    row.set_margin_start(8)
+    row.set_margin_end(8)
+    row.set_margin_top(4)
+    row.set_margin_bottom(4)
+
+    avatar = _avatar_widget(ai_pb if is_ai else user_pb)
+
+    # Content box
+    content = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=2)
+    content.set_hexpand(True)
+
+    # Name + timestamp header
+    hdr = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=6)
+    name_lbl = Gtk.Label(label=name.upper())
+    name_lbl.get_style_context().add_class('name-ai' if is_ai else 'name-user')
+    name_lbl.set_halign(Gtk.Align.START if is_ai else Gtk.Align.END)
+    hdr.pack_start(name_lbl, False, False, 0) if is_ai else hdr.pack_end(name_lbl, False, False, 0)
+
+    if show_ts:
+        ts = Gtk.Label(label=datetime.now().strftime('%H:%M'))
+        ts.get_style_context().add_class('ts-lbl')
+        ts.set_halign(Gtk.Align.END if is_ai else Gtk.Align.START)
+        hdr.pack_end(ts, False, False, 0) if is_ai else hdr.pack_start(ts, False, False, 0)
+
+    content.pack_start(hdr, False, False, 0)
+
+    # Bubble
+    frame, tv = _make_bubble_tv(cfg)
+    frame.get_style_context().add_class('bubble-ai' if is_ai else 'bubble-user')
+    buf = tv.get_buffer()
+    _setup_bubble_tags(buf)
+    if text:
+        _fill_bubble(buf, text)
+    content.pack_start(frame, True, True, 0)
+
+    # Spacer to push bubble to one side
+    spacer = Gtk.Box()
+    spacer.set_size_request(60, -1)
+
+    if is_ai:
+        row.pack_start(avatar,  False, False, 0)
+        row.pack_start(content, True,  True,  0)
+        row.pack_start(spacer,  False, False, 0)
+    else:
+        row.pack_start(spacer,  False, False, 0)
+        row.pack_start(content, True,  True,  0)
+        row.pack_start(avatar,  False, False, 0)
+
+    row.show_all()
+    return row, tv if streaming else None
+
+
+def _make_typing_indicator(cfg: Config) -> tuple[Gtk.Box, Gtk.Widget]:
+    """Devuelve (row, indicator_widget) para el indicador de 'escribiendo'."""
+    row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
+    row.set_margin_start(8); row.set_margin_end(8)
+    row.set_margin_top(4);   row.set_margin_bottom(4)
+
+    acc = cfg.get('accent', C_YELLOW)
+    dots = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=4)
+    for _ in range(3):
+        d = Gtk.Box()
+        d.set_size_request(6, 6)
+        d.get_style_context().add_class('typing-dot')
+        dots.pack_start(d, False, False, 0)
+
+    frame = Gtk.Frame()
+    frame.set_shadow_type(Gtk.ShadowType.NONE)
+    frame.get_style_context().add_class('bubble-ai')
+    inner = Gtk.Box()
+    inner.set_margin_top(10); inner.set_margin_bottom(10)
+    inner.set_margin_start(12); inner.set_margin_end(12)
+    inner.pack_start(dots, False, False, 0)
+    frame.add(inner)
+
+    row.pack_start(Gtk.Box(), False, False, 0)  # avatar placeholder
+    row.pack_start(frame, False, False, 0)
+    row.pack_start(Gtk.Box(), True, True, 0)
+    row.show_all()
+    return row, dots
+
+
+# ══════════════════════════════════════════════════════════════════════
+#  Backend claude CLI
+# ══════════════════════════════════════════════════════════════════════
+def _run_claude_image(image_path: str, prompt: str, cfg: Config,
+                      claude_dir: str | None = None) -> tuple[str, str]:
+    """Envía imagen + texto al CLI via stream-json (base64)."""
+    with open(image_path, 'rb') as f:
+        b64 = base64.b64encode(f.read()).decode()
+
+    content = [
+        {'type': 'image', 'source': {'type': 'base64',
+                                     'media_type': 'image/png', 'data': b64}},
+        {'type': 'text',  'text': prompt or 'Describe y analiza esta imagen.'},
+    ]
+    user_block = json.dumps({
+        'type': 'user',
+        'message': {'role': 'user', 'content': content},
+    })
+
+    env = {**os.environ, 'PATH': _ext_path()}
+    if claude_dir:
+        env['CLAUDE_CONFIG_DIR'] = claude_dir
+
+    args = [CLAUDE_BIN, '--print', '--output-format', 'json',
+            '--input-format', 'stream-json',
+            '--append-system-prompt', cfg.get('personality', '')]
+
+    result = subprocess.run(args, input=user_block + '\n',
+                            capture_output=True, text=True, timeout=180, env=env)
+    if result.returncode != 0:
+        err = (result.stderr or result.stdout or '').strip()
+        raise RuntimeError(f'Image CLI error: {err[:300]}')
+
+    # El output puede tener varias líneas JSON; buscar la que tiene 'result'
+    for line in reversed(result.stdout.strip().splitlines()):
+        try:
+            d = json.loads(line)
+            if d.get('result'):
+                return d['result'], d.get('session_id', '')
+        except Exception:
+            pass
+    raise RuntimeError('No se pudo parsear respuesta con imagen')
+
+
+def _run_claude(message: str, session_id: str | None,
+                cfg: Config, claude_dir: str | None = None,
+                on_compact=None) -> tuple[str, str]:
+    """Llama al CLI de Claude con stream-json para detectar compactación."""
+    env = {**os.environ, 'PATH': _ext_path()}
+    if claude_dir:
+        env['CLAUDE_CONFIG_DIR'] = claude_dir
+
+    args = [CLAUDE_BIN, '--print', '--verbose', '--output-format', 'stream-json',
+            '--append-system-prompt', cfg.get('personality', '')]
+    if session_id:
+        args += ['--resume', session_id]
+    model = cfg.get('model')
+    if model:
+        args += ['--model', model]
+    args.append(message)
+
+    proc = subprocess.Popen(args, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                            text=True, env=env, bufsize=1)
+
+    full_result = ''
+    new_sid     = session_id or ''
+    compacting  = False
+    last_ts     = time.time()
+
+    try:
+        for raw in proc.stdout:
+            last_ts = time.time()
+            line = raw.strip()
+            if not line:
+                continue
+            try:
+                ev = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+
+            ev_type = ev.get('type', '')
+            ev_sub  = ev.get('subtype', '')
+
+            # Detectar evento de compactación
+            is_compact_ev = (
+                ev_type in ('compact', 'compaction') or
+                ev_sub  in ('compact', 'compaction', 'compacted', 'summary') or
+                ('compact' in ev_type.lower()) or
+                (ev_type == 'system' and 'compact' in str(ev).lower())
+            )
+            if is_compact_ev and not compacting:
+                compacting = True
+                if on_compact:
+                    on_compact(True)
+
+            if ev_type == 'result':
+                if ev.get('is_error'):
+                    raise RuntimeError(ev.get('result', 'Error desconocido'))
+                full_result = ev.get('result', '')
+                new_sid     = ev.get('session_id', new_sid)
+                break
+
+        proc.wait(timeout=10)
+    except Exception:
+        proc.kill()
+        raise
+    finally:
+        if compacting and on_compact:
+            on_compact(False)
+
+    if proc.returncode != 0 and not full_result:
+        err = (proc.stderr.read() if proc.stderr else '').strip()
+        raise RuntimeError(f"CLI error ({proc.returncode}): {err[:300]}")
+    return full_result, new_sid
+
+
+def call_claude(message: str, session_id: str | None,
+                cfg: Config, on_compact=None) -> tuple[str, str, str]:
+    """
+    Llama a claude con failover automático entre cuentas.
+    Retorna (respuesta, session_id, label_cuenta_usada).
+    """
+    accounts = cfg.get('accounts', [])
+    if not accounts:
+        # Primera vez: migrar automáticamente con la cuenta actual
+        accounts = default_accounts()
+        cfg.set('accounts', accounts)
+
+    now = datetime.now().timestamp()
+    start = cfg.get('current_account_idx', 0) or 0
+    n     = len(accounts)
+    tried = 0
+
+    for i in range(n):
+        idx = (start + i) % n
+        acc = accounts[idx]
+        if not acc.get('enabled', True):
+            continue
+        dep = acc.get('depleted_until')
+        if dep and now < dep:
+            continue
+
+        tried += 1
+        claude_dir = acc.get('claude_dir')
+        try:
+            resp, sid = _run_claude(message, session_id, cfg, claude_dir,
+                                   on_compact=on_compact)
+            # Si cambiamos de cuenta, actualizar índice activo
+            if idx != start:
+                cfg.set('current_account_idx', idx)
+            return resp, sid, acc.get('label', f'Cuenta {idx+1}')
+        except RuntimeError as e:
+            if _is_rate_limit(str(e)):
+                # Marcar agotada por 1 hora y probar siguiente
+                accounts[idx]['depleted_until'] = now + 3600
+                cfg.save_all({'accounts': accounts})
+                continue
+            raise
+
+    if tried == 0:
+        raise RuntimeError('No hay cuentas habilitadas.')
+    raise RuntimeError('Todas las cuentas están agotadas o sin tokens. '
+                       'Prueba de nuevo en una hora o agrega otra cuenta.')
+
+
+# ══════════════════════════════════════════════════════════════════════
+#  Ventana principal
+# ══════════════════════════════════════════════════════════════════════
+class AuroraWindow(Gtk.Window):
+
+    def __init__(self, cfg: Config):
+        super().__init__(title='Aurora')
+        self.cfg   = cfg
+        self.conv  = Conversation()
+        self._busy = False
+        self._typing_row   = None
+        self._stream_tv    = None
+        self._stream_buf   = None
+        self._anim_text    = ''
+        self._anim_pos     = 0
+        self._css_provider = None
+        self._blur_pb      = None   # GdkPixbuf con fondo difuminado
+        self._ai_pb, self._user_pb = load_pixbufs(cfg)
+
+        self._mini_mode          = False
+        self._compact_bar_widget = None
+        self._compact_timer      = None
+        self._build_ui()
+        self._reload_css()
+        self._position()
+        self._greet()
+        self._setup_global_hotkey()
+        self._setup_clipboard_monitor()
+        self._setup_sysmon()
+        GLib.timeout_add(400, self._show_boot_animation)
+
+    # ── CSS ────────────────────────────────────────────────────────
+    def _reload_css(self):
+        if self._css_provider:
+            Gtk.StyleContext.remove_provider_for_screen(
+                Gdk.Screen.get_default(), self._css_provider)
+        self._css_provider = Gtk.CssProvider()
+        self._css_provider.load_from_data(build_css(self.cfg))
+        Gtk.StyleContext.add_provider_for_screen(
+            Gdk.Screen.get_default(), self._css_provider,
+            Gtk.STYLE_PROVIDER_PRIORITY_APPLICATION + 20)
+
+    # ── Posición ───────────────────────────────────────────────────
+    def _position(self):
+        display = Gdk.Display.get_default()
+        monitor = display.get_monitor(0)
+        geom    = monitor.get_geometry()
+        w, _    = self.get_default_size()
+        self.move(geom.x + geom.width - w - 6, geom.y + 32)
+
+    # ── UI ─────────────────────────────────────────────────────────
+    def _build_ui(self):
+        self.set_default_size(480, 660)
+        self.set_type_hint(Gdk.WindowTypeHint.DIALOG)
+        self.set_skip_taskbar_hint(True)
+        self.set_keep_above(True)
+        self.get_style_context().add_class('aurora-win')
+        rgba = self.get_screen().get_rgba_visual()
+        if rgba:
+            self.set_visual(rgba)
+            self.set_app_paintable(True)
+        self.connect('delete-event', lambda *_: self.hide() or True)
+        self.connect('draw', self._on_draw)
+
+        root = Gtk.Box(orientation=Gtk.Orientation.VERTICAL)
+        self._root_box = root   # referencia para boot animation
+        self.add(root)
+
+        # ── Header ──────────────────────────────────────────────
+        hdr = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=6)
+        hdr.get_style_context().add_class('aurora-header')
+        root.pack_start(hdr, False, False, 0)
+
+        vb = Gtk.Box(orientation=Gtk.Orientation.VERTICAL)
+        self._title_lbl = Gtk.Label()
+        self._title_lbl.get_style_context().add_class('aurora-title')
+        self._title_lbl.set_halign(Gtk.Align.START)
+        self._sub_lbl = Gtk.Label(label='ENLACE NEURAL ACTIVO')
+        self._sub_lbl.get_style_context().add_class('aurora-sub')
+        self._sub_lbl.set_halign(Gtk.Align.START)
+        vb.pack_start(self._title_lbl, False, False, 0)
+        vb.pack_start(self._sub_lbl,   False, False, 0)
+        hdr.pack_start(vb, True, True, 0)
+        self._update_title()
+
+        for lbl, cb in [('Historial',  self._show_history),
+                         ('+ Nueva',    self._new_conv),
+                         ('📷',         self._screenshot_action),
+                         ('↓',          self._export_conversation),
+                         ('⚙',          self._show_settings)]:
+            b = Gtk.Button(label=lbl)
+            b.get_style_context().add_class('aurora-btn-sm')
+            b.connect('clicked', cb)
+            hdr.pack_start(b, False, False, 0)
+
+        # ── Sysmon bar ───────────────────────────────────────────
+        self._sysmon_bar = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL)
+        self._sysmon_bar.get_style_context().add_class('sysmon-bar')
+        self._sysmon_lbl = Gtk.Label(label='')
+        self._sysmon_lbl.get_style_context().add_class('sysmon-lbl')
+        self._sysmon_lbl.set_halign(Gtk.Align.START)
+        self._sysmon_bar.pack_start(self._sysmon_lbl, True, True, 0)
+        root.pack_start(self._sysmon_bar, False, False, 0)
+        if not self.cfg.get('show_sysmon', True):
+            self._sysmon_bar.hide()
+
+        # ── Chat scroll ──────────────────────────────────────────
+        self._scroll = Gtk.ScrolledWindow()
+        self._scroll.set_policy(Gtk.PolicyType.NEVER, Gtk.PolicyType.AUTOMATIC)
+        self._scroll.set_vexpand(True)
+        self._scroll.get_style_context().add_class('chat-scroll')
+        root.pack_start(self._scroll, True, True, 0)
+
+        self._chat_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=0)
+        self._chat_box.get_style_context().add_class('chat-box')
+        self._chat_box.set_margin_top(6)
+        self._chat_box.set_margin_bottom(6)
+        self._scroll.add(self._chat_box)
+
+        # ── Drag & Drop en el área de chat ───────────────────────
+        self._scroll.drag_dest_set(
+            Gtk.DestDefaults.ALL, [], Gdk.DragAction.COPY)
+        self._scroll.drag_dest_add_uri_targets()
+        self._scroll.drag_dest_add_text_targets()
+        self._scroll.connect('drag-data-received', self._on_drag_data)
+
+        # ── Status ───────────────────────────────────────────────
+        self._status = Gtk.Label(label='')
+        self._status.get_style_context().add_class('aurora-status')
+        self._status.set_halign(Gtk.Align.START)
+        root.pack_start(self._status, False, False, 0)
+
+        # ── Input ────────────────────────────────────────────────
+        ib = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=6)
+        ib.get_style_context().add_class('aurora-input-wrap')
+        root.pack_start(ib, False, False, 0)
+
+        self._inp = Gtk.TextView()
+        self._inp.set_wrap_mode(Gtk.WrapMode.WORD_CHAR)
+        self._inp.get_style_context().add_class('aurora-input')
+        self._inp.set_left_margin(8); self._inp.set_right_margin(8)
+        self._inp.set_top_margin(6);  self._inp.set_bottom_margin(6)
+        self._inp.set_size_request(-1, 64)
+        self._inp.connect('key-press-event', self._on_key)
+        ib.pack_start(self._inp, True, True, 0)
+
+        self._btn = Gtk.Button(label='↑')
+        self._btn.get_style_context().add_class('aurora-btn-send')
+        self._btn.connect('clicked', self._send)
+        self._btn.set_valign(Gtk.Align.END)
+        ib.pack_start(self._btn, False, False, 0)
+
+        self.show_all()
+
+    def _update_title(self):
+        name = self.cfg.get('aurora_name', 'Aurora').upper()
+        self._title_lbl.set_label(f'⚡ {name}')
+
+    # ══════════════════════════════════════════════════════════════
+    # SYSMON — stats CPU/RAM en tiempo real
+    # ══════════════════════════════════════════════════════════════
+    def _setup_sysmon(self):
+        if not self.cfg.get('show_sysmon', True):
+            return
+        GLib.timeout_add(2000, self._tick_sysmon)
+
+    def _tick_sysmon(self):
+        try:
+            cpu  = psutil.cpu_percent(interval=None)
+            ram  = psutil.virtual_memory()
+            net  = psutil.net_io_counters()
+            rx   = getattr(self, '_last_rx', net.bytes_recv)
+            tx   = getattr(self, '_last_tx', net.bytes_sent)
+            drx  = (net.bytes_recv - rx) / 2048  # KB/s
+            dtx  = (net.bytes_sent - tx) / 2048
+            self._last_rx = net.bytes_recv
+            self._last_tx = net.bytes_sent
+
+            def bar(pct, width=8):
+                filled = int(pct / 100 * width)
+                return '█' * filled + '░' * (width - filled)
+
+            txt = (f'CPU {bar(cpu)} {cpu:4.1f}%   '
+                   f'RAM {bar(ram.percent)} {ram.percent:4.1f}%   '
+                   f'↓{drx:5.1f} ↑{dtx:5.1f} KB/s')
+            self._sysmon_lbl.set_text(txt)
+        except Exception:
+            pass
+        return self.cfg.get('show_sysmon', True)  # continuar o detener
+
+    # ══════════════════════════════════════════════════════════════
+    # BOOT ANIMATION — secuencia de arranque cyberpunk
+    # ══════════════════════════════════════════════════════════════
+    BOOT_LINES = [
+        '> AURORA NEURAL INTERFACE v2.0',
+        '> Inicializando núcleo cuántico...',
+        '> Cargando módulos de memoria..........  [OK]',
+        '> Enlazando con claude CLI................[OK]',
+        '> Activando monitor de portapapeles.......[OK]',
+        '> Hotkey Ctrl+Alt+Space registrado.......[OK]',
+        '> Módulos de visión listos...............[OK]',
+        '> Iniciando monitor de sistema...........[OK]',
+        '',
+        '> ENLACE NEURAL ESTABLECIDO',
+        '> Bienvenido, operador.',
+    ]
+
+    def _show_boot_animation(self):
+        if not self.cfg.get('boot_animation', True):
+            return
+        # Solo una vez por día
+        today = datetime.now().strftime('%Y-%m-%d')
+        last  = self.cfg.get('_last_boot_date', '')
+        if last == today:
+            return
+        self.cfg.set('_last_boot_date', today)
+
+        overlay = Gtk.Box(orientation=Gtk.Orientation.VERTICAL)
+        overlay.get_style_context().add_class('boot-overlay')
+        overlay.set_hexpand(True); overlay.set_vexpand(True)
+
+        tv = Gtk.TextView()
+        tv.set_editable(False); tv.set_cursor_visible(False)
+        tv.set_wrap_mode(Gtk.WrapMode.WORD)
+        tv.set_left_margin(24); tv.set_right_margin(24)
+        tv.set_top_margin(60)
+        tv.get_style_context().add_class('boot-tv')
+        buf = tv.get_buffer()
+        overlay.pack_start(tv, True, True, 0)
+        overlay.show_all()
+
+        # Superponer sobre el contenido
+        self._root_box.pack_start(overlay, True, True, 0)
+        self._root_box.reorder_child(overlay, 0)
+
+        lines   = list(self.BOOT_LINES)
+        state   = {'i': 0, 'pos': 0, 'text': ''}
+
+        def tick():
+            if state['i'] >= len(lines):
+                GLib.timeout_add(600, lambda: (
+                    self._root_box.remove(overlay) or
+                    overlay.destroy() or False))
+                return False
+            line = lines[state['i']]
+            if state['pos'] <= len(line):
+                chunk = line[state['pos']:state['pos'] + 3]
+                state['text'] += chunk
+                state['pos']  += 3
+                buf.set_text(state['text'])
+            else:
+                state['text'] += '\n'
+                state['i']   += 1
+                state['pos']  = 0
+            return True
+
+        GLib.timeout_add(18, tick)
+
+    # ══════════════════════════════════════════════════════════════
+    # MODO MINI — ventana compacta solo con input
+    # ══════════════════════════════════════════════════════════════
+    def _toggle_mini_mode(self, *_):
+        if not hasattr(self, '_mini_mode'):
+            self._mini_mode = False
+
+        if not self._mini_mode:
+            # Guardar geometría actual y entrar en mini
+            self._full_size = self.get_size()
+            self._chat_box.get_parent().get_parent().hide()  # scroll
+            self._status.hide()
+            self._title_lbl.set_label('⚡')
+            self._sub_lbl.hide()
+            if hasattr(self, '_sysmon_bar'):
+                self._sysmon_bar.hide()
+            self.resize(460, 80)
+            self._mini_mode = True
+            self._mini_btn.set_label('⬜')
+        else:
+            self._chat_box.get_parent().get_parent().show()
+            self._status.show()
+            self._sub_lbl.show()
+            if hasattr(self, '_sysmon_bar'):
+                self._sysmon_bar.show()
+            self._update_title()
+            w, h = self._full_size
+            self.resize(w, h)
+            self._mini_mode = False
+            self._mini_btn.set_label('⬛')
+
+    # ══════════════════════════════════════════════════════════════
+    # NOTIFICACIONES DE ESCRITORIO
+    # ══════════════════════════════════════════════════════════════
+    def _desktop_notify(self, body: str):
+        if not self.cfg.get('notifications', True):
+            return
+        if self.get_visible() and self.is_active():
+            return  # ya está en foco, no molestar
+        try:
+            if HAS_NOTIFY:
+                n = GNotify.Notification.new(
+                    self.cfg.get('aurora_name', 'Aurora'),
+                    body[:120], str(ICON))
+                n.show()
+            else:
+                subprocess.Popen(
+                    ['notify-send', '-i', str(ICON),
+                     self.cfg.get('aurora_name', 'Aurora'), body[:120]],
+                    stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        except Exception:
+            pass
+
+    # ══════════════════════════════════════════════════════════════
+    # EXPORTAR CONVERSACIÓN
+    # ══════════════════════════════════════════════════════════════
+    def _export_conversation(self, *_):
+        if not self.conv.messages:
+            return
+        name  = self.cfg.get('aurora_name', 'Aurora')
+        uname = self.cfg.get('user_name', 'Tú')
+        lines = [f'# Conversación con {name}',
+                 f'*{self.conv.created[:16].replace("T", " ")}*\n']
+        for m in self.conv.messages:
+            who = name if m['role'] == 'assistant' else uname
+            lines.append(f'### {who}\n{m["content"]}\n')
+        md = '\n'.join(lines)
+
+        dlg = Gtk.Dialog(title='Exportar conversación',
+                         parent=self, modal=True)
+        dlg.set_default_size(340, 140)
+        ca = dlg.get_content_area()
+        ca.set_margin_top(12); ca.set_margin_bottom(8)
+        ca.set_margin_start(14); ca.set_margin_end(14)
+        ca.set_spacing(8)
+
+        ca.pack_start(Gtk.Label(label='¿Cómo exportar?'), False, False, 0)
+        dlg.add_button('Copiar Markdown', 10)
+        dlg.add_button('Guardar archivo', 11)
+        dlg.add_button('Cancelar', Gtk.ResponseType.CANCEL)
+        dlg.show_all()
+        resp = dlg.run(); dlg.destroy()
+
+        if resp == 10:
+            Gtk.Clipboard.get(Gdk.SELECTION_CLIPBOARD).set_text(md, -1)
+            self._status.set_text('✔ Conversación copiada al portapapeles')
+            GLib.timeout_add(3000, lambda: self._status.set_text('') or False)
+
+        elif resp == 11:
+            fc = Gtk.FileChooserDialog(
+                title='Guardar conversación',
+                parent=self, action=Gtk.FileChooserAction.SAVE)
+            fc.add_button('Cancelar', Gtk.ResponseType.CANCEL)
+            fc.add_button('Guardar',  Gtk.ResponseType.OK)
+            ts   = datetime.now().strftime('%Y%m%d_%H%M')
+            safe = self.conv.title[:30].replace('/', '-').replace(' ', '_')
+            fc.set_current_name(f'aurora_{ts}_{safe}.md')
+            export_dir = self.cfg.get('export_dir',
+                                      str(Path.home() / 'Documents'))
+            if Path(export_dir).exists():
+                fc.set_current_folder(export_dir)
+            if fc.run() == Gtk.ResponseType.OK:
+                Path(fc.get_filename()).write_text(md, encoding='utf-8')
+                self._status.set_text(f'✔ Guardado en {fc.get_filename()}')
+                GLib.timeout_add(4000, lambda: self._status.set_text('') or False)
+            fc.destroy()
+
+    # ══════════════════════════════════════════════════════════════
+    # INTEGRACIÓN 1: Hotkey global (Ctrl+Alt+Space)
+    # ══════════════════════════════════════════════════════════════
+    def _setup_global_hotkey(self):
+        if not HAS_XLIB or not self.cfg.get('hotkey_enabled', True):
+            return
+        threading.Thread(target=self._hotkey_thread, daemon=True).start()
+
+    def _hotkey_thread(self):
+        try:
+            d = Xdisplay.Display()
+            # evitar que BadAccess llame a sys.exit()
+            def _xlib_err(err, req): raise err
+            d.set_error_handler(_xlib_err)
+            root = d.screen().root
+            code = d.keysym_to_keycode(XK.XK_space)
+            mod  = X.ControlMask | X.Mod1Mask
+            try:
+                root.grab_key(code, mod, True, X.GrabModeAsync, X.GrabModeAsync)
+                root.change_attributes(event_mask=X.KeyPressMask)
+                d.sync()   # fuerza procesamiento de errores antes de next_event
+            except Exception:
+                return     # ya está capturada la tecla, ignorar
+            while True:
+                ev = d.next_event()
+                if ev.type == X.KeyPress and ev.detail == code:
+                    GLib.idle_add(self.toggle)
+        except Exception:
+            pass
+
+    # ══════════════════════════════════════════════════════════════
+    # INTEGRACIÓN 2: Monitor de portapapeles
+    # ══════════════════════════════════════════════════════════════
+    def _setup_clipboard_monitor(self):
+        if not self.cfg.get('clipboard_monitor', True):
+            return
+        self._clip = Gtk.Clipboard.get(Gdk.SELECTION_CLIPBOARD)
+        self._clip.connect('owner-change', self._on_clipboard_change)
+        self._last_clip_text = ''
+
+    def _on_clipboard_change(self, clipboard, event):
+        if self._busy:
+            return
+        text = clipboard.wait_for_text()
+        if not text:
+            return
+        min_chars = self.cfg.get('clipboard_min_chars', 80)
+        if len(text) < min_chars:
+            return
+        if text == self._last_clip_text:
+            return
+        self._last_clip_text = text
+        GLib.idle_add(self._show_clip_popup, text)
+
+    def _show_clip_popup(self, text: str):
+        # Eliminar popup anterior si existe
+        if hasattr(self, '_clip_popup') and self._clip_popup:
+            self._chat_box.remove(self._clip_popup)
+            self._clip_popup = None
+
+        popup = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=4)
+        popup.set_margin_start(10); popup.set_margin_end(10)
+        popup.set_margin_top(4);    popup.set_margin_bottom(4)
+
+        acc = self.cfg.get('accent', C_YELLOW)
+
+        # Preview del texto copiado
+        preview = text[:120] + ('…' if len(text) > 120 else '')
+        prev_lbl = Gtk.Label(label=preview)
+        prev_lbl.set_line_wrap(True)
+        prev_lbl.set_max_width_chars(55)
+        prev_lbl.set_halign(Gtk.Align.START)
+        prev_lbl.set_markup(
+            f'<span foreground="#aaaacc" size="small">📋 {GLib.markup_escape_text(preview)}</span>')
+        popup.pack_start(prev_lbl, False, False, 0)
+
+        btns = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=6)
+
+        def on_analyze(_):
+            self._inp.get_buffer().set_text('')
+            # Pre-cargar el texto en el input con contexto
+            buf = self._inp.get_buffer()
+            buf.set_text(f'Analiza este texto:\n\n{text}')
+            self._chat_box.remove(popup)
+            self._clip_popup = None
+            popup.destroy()
+
+        def on_ask(_):
+            buf = self._inp.get_buffer()
+            existing = buf.get_text(buf.get_start_iter(), buf.get_end_iter(), False)
+            if not existing:
+                buf.set_text(text)
+            self._chat_box.remove(popup)
+            self._clip_popup = None
+            popup.destroy()
+            self._inp.grab_focus()
+
+        def on_dismiss(_):
+            self._chat_box.remove(popup)
+            self._clip_popup = None
+            popup.destroy()
+
+        for lbl, fn in [('Analizar', on_analyze),
+                         ('Usar como contexto', on_ask),
+                         ('✕', on_dismiss)]:
+            b = Gtk.Button(label=lbl)
+            b.get_style_context().add_class('aurora-btn-sm')
+            b.connect('clicked', fn)
+            btns.pack_start(b, False, False, 0)
+
+        popup.pack_start(btns, False, False, 0)
+        popup.get_style_context().add_class('bubble-ai')
+        popup.show_all()
+
+        self._clip_popup = popup
+        self._chat_box.pack_start(popup, False, False, 0)
+        self._scroll_end()
+        # Mostrar la ventana si estaba oculta
+        if not self.get_visible():
+            self._position()
+            self.show_all()
+            self.present()
+        return False
+
+    # ══════════════════════════════════════════════════════════════
+    # INTEGRACIÓN 3: Captura de pantalla + análisis
+    # ══════════════════════════════════════════════════════════════
+    def _screenshot_action(self, *_):
+        dlg = Gtk.Dialog(title='Captura de pantalla', parent=self, modal=True)
+        dlg.set_default_size(340, 160)
+        ca = dlg.get_content_area()
+        ca.set_margin_top(12); ca.set_margin_bottom(12)
+        ca.set_margin_start(16); ca.set_margin_end(16)
+        ca.set_spacing(10)
+
+        lbl = Gtk.Label(label='¿Qué capturar?')
+        lbl.get_style_context().add_class('dlg-title')
+        lbl.set_halign(Gtk.Align.START)
+        ca.pack_start(lbl, False, False, 0)
+
+        prompt_e = Gtk.Entry()
+        prompt_e.set_placeholder_text('Pregunta sobre la captura (opcional)…')
+        ca.pack_start(prompt_e, False, False, 0)
+
+        dlg.add_button('Pantalla completa', 10)
+        dlg.add_button('Cancelar',          Gtk.ResponseType.CANCEL)
+        dlg.show_all()
+        resp = dlg.run()
+        prompt = prompt_e.get_text().strip()
+        dlg.destroy()
+
+        if resp == 10:
+            self.hide()  # Ocultar Aurora de la captura
+            GLib.timeout_add(300, self._do_screenshot, prompt, False)
+
+    def _do_screenshot(self, prompt: str, region: bool):
+        try:
+            raw = '/tmp/aurora_shot.png'
+            display = Gdk.Display.get_default()
+            monitor = display.get_monitor(0)
+            geom    = monitor.get_geometry()
+            subprocess.run([
+                'ffmpeg', '-f', 'x11grab',
+                '-video_size', f'{geom.width}x{geom.height}',
+                '-i', ':0', '-frames:v', '1', '-update', '1', '-y', raw,
+            ], capture_output=True, timeout=5)
+        except Exception as e:
+            GLib.idle_add(self._on_error, f'Captura fallida: {e}')
+            GLib.idle_add(self.show_all)
+            return False
+
+        GLib.idle_add(self.show_all)
+        GLib.idle_add(self.present)
+
+        if Path(raw).exists():
+            # Añadir mensaje del usuario mostrando que se capturó
+            row, _ = _make_message_row(
+                'user', f'[Captura de pantalla] {prompt or ""}',
+                self.cfg, self._ai_pb, self._user_pb)
+            GLib.idle_add(self._add_row, row)
+
+            # Indicador
+            typ_row, _ = _make_typing_indicator(self.cfg)
+            GLib.idle_add(self._add_row, typ_row)
+            GLib.idle_add(setattr, self, '_typing_row', typ_row)
+            self._busy = True
+            GLib.idle_add(self._btn.set_sensitive, False)
+            GLib.idle_add(self._status.set_text, '📷 analizando captura…')
+
+            threading.Thread(
+                target=self._screenshot_worker,
+                args=(raw, prompt or 'Describe en detalle qué ves en esta captura de pantalla.'),
+                daemon=True).start()
+        return False
+
+    def _screenshot_worker(self, path: str, prompt: str):
+        try:
+            accounts = self.cfg.get('accounts', [])
+            if not accounts:
+                accounts = default_accounts()
+            idx  = self.cfg.get('current_account_idx', 0) or 0
+            acc  = accounts[idx % len(accounts)]
+            resp, sid = _run_claude_image(path, prompt, self.cfg,
+                                          acc.get('claude_dir'))
+            GLib.idle_add(self._on_response, resp, sid,
+                          acc.get('label', 'Cuenta principal'))
+        except Exception as e:
+            GLib.idle_add(self._on_error, f'Análisis de imagen: {e}')
+
+    # ══════════════════════════════════════════════════════════════
+    # INTEGRACIÓN 4: Drag & Drop de archivos
+    # ══════════════════════════════════════════════════════════════
+    def _on_drag_data(self, widget, ctx, x, y, data, info, time):
+        uris  = data.get_uris()
+        text  = data.get_text()
+        Gtk.drag_finish(ctx, True, False, time)
+
+        if uris:
+            for uri in uris[:3]:           # máximo 3 archivos a la vez
+                path = uri.replace('file://', '').strip()
+                self._handle_dropped_file(path)
+        elif text:
+            buf = self._inp.get_buffer()
+            buf.set_text(text)
+            self._inp.grab_focus()
+
+    def _handle_dropped_file(self, path: str):
+        p    = Path(path)
+        ext  = p.suffix.lower()
+        acc  = self.cfg.get('accent', C_YELLOW)
+
+        img_exts = {'.png', '.jpg', '.jpeg', '.gif', '.webp', '.bmp'}
+        code_exts = {'.py', '.js', '.ts', '.rs', '.go', '.c', '.cpp',
+                     '.h', '.java', '.rb', '.sh', '.bash', '.json',
+                     '.yaml', '.yml', '.toml', '.sql', '.html', '.css',
+                     '.md', '.txt', '.log', '.xml', '.csv'}
+
+        if ext in img_exts:
+            # Imagen → analizar como screenshot
+            row, _ = _make_message_row(
+                'user', f'[Imagen soltada: {p.name}]',
+                self.cfg, self._ai_pb, self._user_pb)
+            self._add_row(row)
+            typ_row, _ = _make_typing_indicator(self.cfg)
+            self._add_row(typ_row)
+            self._typing_row = typ_row
+            self._busy = True
+            self._btn.set_sensitive(False)
+            self._status.set_text(f'🖼 analizando {p.name}…')
+            threading.Thread(
+                target=self._screenshot_worker,
+                args=(path, f'Analiza esta imagen: {p.name}'),
+                daemon=True).start()
+
+        elif ext == '.pdf':
+            try:
+                result = subprocess.run(['pdftotext', path, '-'],
+                                        capture_output=True, text=True, timeout=15)
+                content = result.stdout[:6000]
+                buf = self._inp.get_buffer()
+                buf.set_text(f'Analiza este PDF ({p.name}):\n\n{content}')
+                self._show_drop_notice(p.name, 'PDF', acc)
+            except Exception as e:
+                self._show_drop_notice(p.name, f'Error: {e}', C_RED)
+
+        elif ext in code_exts or p.stat().st_size < 200_000:
+            try:
+                content = p.read_text(errors='replace')[:8000]
+                lang    = ext.lstrip('.') if ext else 'text'
+                buf     = self._inp.get_buffer()
+                buf.set_text(f'```{lang}\n{content}\n```\n\n')
+                self._show_drop_notice(p.name, ext.lstrip('.') or 'texto', acc)
+            except Exception as e:
+                self._show_drop_notice(p.name, f'Error: {e}', C_RED)
+        else:
+            self._show_drop_notice(p.name, 'tipo no soportado', C_RED)
+
+        self._inp.grab_focus()
+
+    def _show_drop_notice(self, name: str, kind: str, color: str):
+        lbl = Gtk.Label()
+        lbl.set_markup(
+            f'<span foreground="{color}" size="small">↓ {name} ({kind}) cargado</span>')
+        lbl.set_halign(Gtk.Align.CENTER)
+        lbl.set_margin_top(2); lbl.set_margin_bottom(2)
+        lbl.show()
+        self._chat_box.pack_start(lbl, False, False, 0)
+        self._scroll_end()
+
+    # ── Blur background ────────────────────────────────────────────
+    def _window_rect(self):
+        """Devuelve (x, y, w, h) donde aparecerá la ventana."""
+        display = Gdk.Display.get_default()
+        monitor = display.get_monitor(0)
+        geom    = monitor.get_geometry()
+        w, h    = 480, 660
+        x = geom.x + geom.width - w - 6
+        y = geom.y + 32
+        return x, y, w, h
+
+    def _capture_blur_bg(self, x, y, w, h):
+        """Captura el área del escritorio y la difumina con PIL."""
+        try:
+            raw  = '/tmp/aurora_bg_raw.png'
+            blur = '/tmp/aurora_bg_blur.png'
+            # ffmpeg captura desde X11 (sin Aurora, que está oculta)
+            subprocess.run([
+                'ffmpeg', '-f', 'x11grab', '-video_size', f'{w}x{h}',
+                '-i', f':0+{x},{y}', '-frames:v', '1', '-update', '1', '-y', raw,
+            ], capture_output=True, timeout=4)
+            if not Path(raw).exists():
+                return
+            img = Image.open(raw).convert('RGB')
+            img = img.filter(ImageFilter.GaussianBlur(radius=18))
+            img.save(blur)
+            pb = GdkPixbuf.Pixbuf.new_from_file(blur)
+            GLib.idle_add(self._set_blur_pb, pb)
+        except Exception:
+            pass
+
+    def _set_blur_pb(self, pb):
+        self._blur_pb = pb
+        self.queue_draw()
+        return False
+
+    def _on_draw(self, widget, ctx):
+        w = widget.get_allocated_width()
+        h = widget.get_allocated_height()
+        # Radio para las esquinas redondeadas
+        r = 10
+        # Clip con esquinas redondeadas
+        ctx.new_sub_path()
+        ctx.arc(r,     r,     r, math.pi,       1.5 * math.pi)
+        ctx.arc(w - r, r,     r, 1.5 * math.pi, 2 * math.pi)
+        ctx.arc(w - r, h - r, r, 0,              0.5 * math.pi)
+        ctx.arc(r,     h - r, r, 0.5 * math.pi, math.pi)
+        ctx.close_path()
+        ctx.clip()
+
+        if self._blur_pb:
+            pb = self._blur_pb
+            if pb.get_width() != w or pb.get_height() != h:
+                pb = pb.scale_simple(w, h, GdkPixbuf.InterpType.BILINEAR)
+            Gdk.cairo_set_source_pixbuf(ctx, pb, 0, 0)
+            ctx.paint()
+            # Overlay oscuro cyberpunk encima del blur
+            ctx.set_source_rgba(0.024, 0.020, 0.055, 0.76)
+            ctx.paint()
+        else:
+            # Sin blur aún: fondo sólido oscuro semitransparente
+            op = self.cfg.get('window_opacity', 90) / 100
+            ctx.set_source_rgba(0.024, 0.020, 0.055, op)
+            ctx.paint()
+        return False
+
+    # ── Chat helpers ───────────────────────────────────────────────
+    def _add_row(self, row: Gtk.Box):
+        self._chat_box.pack_start(row, False, False, 0)
+        self._scroll_end()
+
+    def _scroll_end(self):
+        GLib.idle_add(self._do_scroll)
+
+    def _do_scroll(self):
+        adj = self._scroll.get_vadjustment()
+        adj.set_value(adj.get_upper() - adj.get_page_size())
+        return False
+
+    def _greet(self):
+        ai_name = self.cfg.get('aurora_name', 'Aurora')
+        text = (f'Enlace establecido. Soy {ai_name} — claude CLI conectado '
+                f'a tu cuenta Pro. ¿En qué puedo ayudarte?')
+        row, _ = _make_message_row('assistant', text, self.cfg,
+                                   self._ai_pb, self._user_pb)
+        self._add_row(row)
+
+    def _new_conv(self, *_):
+        for child in self._chat_box.get_children():
+            self._chat_box.remove(child)
+        self.conv = Conversation()
+        self._greet()
+
+    def _load_conv(self, cid: str):
+        for child in self._chat_box.get_children():
+            self._chat_box.remove(child)
+        self.conv = Conversation(cid)
+        for m in self.conv.messages:
+            row, _ = _make_message_row(m['role'], m['content'],
+                                       self.cfg, self._ai_pb, self._user_pb)
+            self._add_row(row)
+
+    # ── Envío ──────────────────────────────────────────────────────
+    def _on_key(self, widget, event):
+        shift = bool(event.state & Gdk.ModifierType.SHIFT_MASK)
+        if event.keyval in (Gdk.KEY_Return, Gdk.KEY_KP_Enter) and not shift:
+            self._send()
+            return True
+        # Mostrar/ocultar slash popup al escribir
+        GLib.idle_add(self._update_slash_popup)
+        return False
+
+    # ══════════════════════════════════════════════════════════════
+    # SLASH COMMANDS — autocompletado
+    # ══════════════════════════════════════════════════════════════
+    def _update_slash_popup(self):
+        buf  = self._inp.get_buffer()
+        text = buf.get_text(buf.get_start_iter(), buf.get_end_iter(), False)
+        if not text.startswith('/'):
+            self._hide_slash_popup()
+            return False
+        query   = text[1:].lower()
+        cmds    = [c for c in get_commands(self.cfg)
+                   if c['trigger'].startswith(query)]
+        if not cmds:
+            self._hide_slash_popup()
+            return False
+        self._show_slash_popup(cmds)
+        return False
+
+    def _show_slash_popup(self, cmds: list):
+        if not hasattr(self, '_slash_popup') or not self._slash_popup:
+            self._slash_popup = Gtk.Popover()
+            self._slash_popup.set_relative_to(self._inp)
+            self._slash_popup.set_position(Gtk.PositionType.TOP)
+            self._slash_popup.set_modal(False)
+            self._slash_popup.get_style_context().add_class('slash-popup')
+
+        # Reconstruir lista
+        child = self._slash_popup.get_child()
+        if child:
+            self._slash_popup.remove(child)
+
+        lb = Gtk.ListBox()
+        lb.set_selection_mode(Gtk.SelectionMode.BROWSE)
+        lb.get_style_context().add_class('slash-popup')
+
+        for cmd in cmds[:8]:
+            row = Gtk.ListBoxRow()
+            lbl = Gtk.Label(label=cmd['label'])
+            lbl.get_style_context().add_class('slash-row')
+            lbl.set_halign(Gtk.Align.START)
+            row._cmd = cmd
+            row.add(lbl)
+            lb.add(row)
+
+        lb.select_row(lb.get_row_at_index(0))
+
+        def on_row_activated(lb, row):
+            self._apply_slash_command(row._cmd)
+
+        lb.connect('row-activated', on_row_activated)
+        self._slash_lb = lb
+        self._slash_popup.add(lb)
+        self._slash_popup.show_all()
+
+    def _hide_slash_popup(self):
+        if hasattr(self, '_slash_popup') and self._slash_popup:
+            self._slash_popup.popdown()
+
+    def _apply_slash_command(self, cmd: dict):
+        self._hide_slash_popup()
+        if cmd['prompt'] == '__TERMINAL__':
+            self._inp.get_buffer().set_text('/run ')
+            self._inp.grab_focus()
+            return
+        if cmd['prompt'] == '__SUDO__':
+            self._inp.get_buffer().set_text('/sudo ')
+            self._inp.grab_focus()
+            return
+        self._inp.get_buffer().set_text(cmd['prompt'])
+        self._inp.grab_focus()
+        # Colocar cursor al final
+        buf = self._inp.get_buffer()
+        buf.place_cursor(buf.get_end_iter())
+
+    def _send(self, *_):
+        if self._busy: return
+        self._hide_slash_popup()
+        if not CLAUDE_BIN:
+            self._show_no_cli()
+            return
+        ib   = self._inp.get_buffer()
+        text = ib.get_text(ib.get_start_iter(), ib.get_end_iter(), False).strip()
+        if not text: return
+
+        # ── Modo terminal (/run <cmd>) ─────────────────────────
+        if text.startswith('/run ') or text.startswith('/sudo '):
+            prefix_len = 5 if text.startswith('/run ') else 6
+            cmd = text[prefix_len:].strip()
+            if not cmd:
+                return
+            ib.set_text('')
+            # Si el comando empieza con "sudo ", extraer y usar ruta sudo
+            if cmd.startswith('sudo '):
+                cmd = cmd[5:].strip()
+                self._run_terminal_command(cmd, use_sudo=True)
+            else:
+                use_sudo = text.startswith('/sudo ')
+                self._run_terminal_command(cmd, use_sudo=use_sudo)
+            return
+
+        ib.set_text('')
+
+        # Mensaje del usuario
+        row, _ = _make_message_row('user', text, self.cfg,
+                                   self._ai_pb, self._user_pb)
+        self._add_row(row)
+        self.conv.add('user', text)
+
+        # Indicador "procesando"
+        self._typing_row, _ = _make_typing_indicator(self.cfg)
+        self._add_row(self._typing_row)
+
+        self._busy = True
+        self._btn.set_sensitive(False)
+        self._status.set_text('⚡ procesando…')
+
+        threading.Thread(target=self._worker,
+                         args=(text, self.conv.session_id),
+                         daemon=True).start()
+
+    def _worker(self, message: str, session_id: str | None):
+        def _on_compact(active: bool):
+            GLib.idle_add(self._show_compact_bar if active else self._hide_compact_bar)
+        try:
+            resp, sid, acc_label = call_claude(message, session_id, self.cfg,
+                                               on_compact=_on_compact)
+            GLib.idle_add(self._on_response, resp, sid, acc_label)
+        except Exception as e:
+            GLib.idle_add(self._hide_compact_bar)
+            GLib.idle_add(self._on_error, str(e))
+
+    def _on_response(self, text: str, sid: str, acc_label: str):
+        # Eliminar indicador
+        if self._typing_row:
+            self._chat_box.remove(self._typing_row)
+            self._typing_row = None
+
+        self.conv.session_id = sid
+        self.conv.add('assistant', text)
+
+        # Mostrar qué cuenta se usó si no es la principal
+        accounts = self.cfg.get('accounts', [])
+        idx = self.cfg.get('current_account_idx', 0) or 0
+        main_label = accounts[0].get('label') if accounts else None
+        if acc_label and main_label and acc_label != main_label:
+            self._status.set_text(f'⚡ usando: {acc_label}')
+        else:
+            self._status.set_text('')
+
+        # Burbuja de respuesta vacía para animar (streaming)
+        row, tv = _make_message_row('assistant', '', self.cfg,
+                                    self._ai_pb, self._user_pb,
+                                    streaming=True)
+        self._add_row(row)
+        self._stream_row = row
+        self._stream_tv  = tv
+        self._stream_buf = tv.get_buffer()
+        _setup_bubble_tags(self._stream_buf)
+        self._anim_text = text
+        self._anim_pos  = 0
+        GLib.timeout_add(5, self._anim_tick)
+        return False
+
+    def _anim_tick(self):
+        if self._anim_pos >= len(self._anim_text):
+            # Animación terminada — reconstruir burbuja con código enriquecido
+            self._finalize_bubble(self._stream_row, self._anim_text)
+            self._busy = False
+            self._btn.set_sensitive(True)
+            self._stream_tv = self._stream_buf = self._stream_row = None
+            self._scroll_end()
+            return False
+        n     = self.cfg.get('anim_speed', 4)
+        chunk = self._anim_text[self._anim_pos:self._anim_pos + n]
+        end   = self._stream_buf.get_end_iter()
+        self._stream_buf.insert_with_tags_by_name(end, chunk, 'normal')
+        self._anim_pos += n
+        self._scroll_end()
+        return True
+
+    def _finalize_bubble(self, row: Gtk.Box, text: str):
+        """Reemplaza el TextView de streaming por contenido enriquecido."""
+        if not row or not text:
+            return
+        # Estructura del row: [avatar/spacer, content_box, spacer/avatar]
+        # content_box es el hijo HExpand=True
+        content_box = None
+        for child in row.get_children():
+            if child.get_hexpand():
+                content_box = child
+                break
+        if not content_box:
+            return
+
+        # El último hijo de content_box es el bubble frame (streaming)
+        kids = content_box.get_children()
+        if not kids:
+            return
+        old_bubble = kids[-1]
+
+        # Construir contenido enriquecido
+        rich = _make_rich_bubble_content(text, self.cfg)
+        is_ai = True  # siempre es respuesta del asistente aquí
+        rich.get_style_context().add_class('bubble-ai')
+        rich.show_all()
+
+        content_box.remove(old_bubble)
+        content_box.pack_start(rich, True, True, 0)
+
+    def _on_error(self, msg: str):
+        if self._typing_row:
+            self._chat_box.remove(self._typing_row)
+            self._typing_row = None
+        row, _ = _make_message_row('assistant',
+                                   f'[Error de conexión: {msg}]',
+                                   self.cfg, self._ai_pb, self._user_pb)
+        self._add_row(row)
+        self._busy = False
+        self._btn.set_sensitive(True)
+        self._status.set_text('')
+        return False
+
+    # ══════════════════════════════════════════════════════════════
+    # MODO TERMINAL — /run y /sudo
+    # ══════════════════════════════════════════════════════════════
+    def _run_terminal_command(self, cmd: str, use_sudo: bool = False):
+        if use_sudo:
+            # Verificar si NOPASSWD está configurado
+            if not SUDO_MGR.is_nopasswd():
+                self._show_sudo_setup_dialog(cmd)
+                return
+        elif self.cfg.get('terminal_confirm', True):
+            dlg = Gtk.MessageDialog(
+                parent=self, modal=True,
+                message_type=Gtk.MessageType.WARNING,
+                buttons=Gtk.ButtonsType.OK_CANCEL,
+                text='Ejecutar comando')
+            dlg.format_secondary_markup(
+                f'<tt>{GLib.markup_escape_text(cmd)}</tt>\n\n'
+                '¿Confirmas la ejecución?')
+            resp = dlg.run(); dlg.destroy()
+            if resp != Gtk.ResponseType.OK:
+                return
+
+        prefix   = '# ' if use_sudo else '$ '
+        row_u, _ = _make_message_row('user', f'{prefix}{cmd}',
+                                     self.cfg, self._ai_pb, self._user_pb)
+        self._add_row(row_u)
+        self._busy = True
+        self._btn.set_sensitive(False)
+        self._status.set_text('⚡ ejecutando…')
+
+        threading.Thread(target=self._terminal_worker,
+                         args=(cmd, use_sudo),
+                         daemon=True).start()
+
+    def _show_sudo_setup_dialog(self, pending_cmd: str = ''):
+        """
+        Muestra instrucciones para configurar NOPASSWD en sudoers.
+        El usuario ejecuta el comando UNA VEZ desde la terminal
+        (donde sí puede usar huella o contraseña normalmente).
+        """
+        dlg = Gtk.Dialog(title='Configurar sudo para Aurora',
+                         parent=self, modal=True)
+        dlg.set_default_size(480, 320)
+        ca = dlg.get_content_area()
+        ca.set_spacing(10)
+        ca.set_margin_top(16); ca.set_margin_bottom(12)
+        ca.set_margin_start(18); ca.set_margin_end(18)
+
+        title = Gtk.Label()
+        title.set_markup(
+            '<span foreground="#FF003C" weight="bold" size="large">'
+            '🔒  CONFIGURACIÓN SUDO</span>')
+        title.set_halign(Gtk.Align.START)
+        ca.pack_start(title, False, False, 0)
+
+        info = Gtk.Label()
+        info.set_markup(
+            '<span size="small">Aurora necesita ejecutar comandos sudo sin '
+            'interacción.\nEjecuta <b>una sola vez</b> el comando de abajo '
+            'en tu terminal\n(puedes usar huella o contraseña normalmente allí).</span>')
+        info.set_line_wrap(True)
+        info.set_halign(Gtk.Align.START)
+        ca.pack_start(info, False, False, 4)
+
+        # Comando a copiar
+        cmd_box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=4)
+        cmd_entry = Gtk.Entry()
+        cmd_entry.set_text(_SUDO_SETUP_CMD)
+        cmd_entry.set_editable(False)
+        cmd_entry.set_hexpand(True)
+        cmd_entry.get_style_context().add_class('sudo-entry')
+        cmd_box.pack_start(cmd_entry, True, True, 0)
+
+        copy_btn = Gtk.Button(label='Copiar')
+        copy_btn.get_style_context().add_class('aurora-btn-sm')
+        def on_copy(_):
+            Gtk.Clipboard.get(Gdk.SELECTION_CLIPBOARD).set_text(
+                _SUDO_SETUP_CMD, -1)
+            copy_btn.set_label('✔')
+            GLib.timeout_add(2000, lambda: copy_btn.set_label('Copiar') or False)
+        copy_btn.connect('clicked', on_copy)
+        cmd_box.pack_start(copy_btn, False, False, 0)
+        ca.pack_start(cmd_box, False, False, 0)
+
+        # Estado
+        status_lbl = Gtk.Label(label='')
+        status_lbl.set_halign(Gtk.Align.START)
+        ca.pack_start(status_lbl, False, False, 0)
+
+        dlg.add_button('Cancelar', Gtk.ResponseType.CANCEL)
+        verify_btn = dlg.add_button('✔ Verificar y ejecutar', Gtk.ResponseType.OK)
+        verify_btn.get_style_context().add_class('aurora-btn-send')
+
+        def on_verify(_):
+            if SUDO_MGR.is_nopasswd():
+                status_lbl.set_markup(
+                    '<span foreground="#00e5ff">✔ ¡Configurado! '
+                    'Cerrando…</span>')
+                GLib.timeout_add(800, lambda: (dlg.response(Gtk.ResponseType.OK)
+                                               or False))
+            else:
+                status_lbl.set_markup(
+                    '<span foreground="#FF003C">✗ Aún sin acceso. '
+                    'Ejecuta el comando en la terminal primero.</span>')
+
+        verify_btn.connect('clicked', on_verify)
+        dlg.show_all()
+
+        if dlg.run() == Gtk.ResponseType.OK and SUDO_MGR.is_nopasswd():
+            dlg.destroy()
+            # Ejecutar el comando pendiente ahora que está configurado
+            if pending_cmd:
+                self._run_terminal_command(pending_cmd, use_sudo=True)
+        else:
+            dlg.destroy()
+
+    def _terminal_worker(self, cmd: str, use_sudo: bool):
+        try:
+            if use_sudo:
+                output, rc = SUDO_MGR.run(cmd)
+            else:
+                result = subprocess.run(
+                    cmd, shell=True, capture_output=True, text=True,
+                    timeout=60, env={**os.environ, 'PATH': _ext_path()})
+                output = (result.stdout + result.stderr).strip() or '(sin output)'
+                rc     = result.returncode
+
+            GLib.idle_add(self._show_terminal_output, cmd, output, rc, use_sudo)
+        except subprocess.TimeoutExpired:
+            GLib.idle_add(self._show_terminal_output, cmd,
+                          '[timeout: el comando tardó más de 60s]', -1, use_sudo)
+        except Exception as e:
+            GLib.idle_add(self._show_terminal_output, cmd, str(e), -1, use_sudo)
+
+    def _show_terminal_output(self, cmd: str, output: str, rc: int,
+                              use_sudo: bool = False):
+        outer = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
+        outer.set_margin_start(8); outer.set_margin_end(8)
+        outer.set_margin_top(4);   outer.set_margin_bottom(4)
+
+        avatar = _avatar_widget(self._ai_pb)
+        outer.pack_start(avatar, False, False, 0)
+
+        content = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=2)
+        content.set_hexpand(True)
+
+        tag   = '🔒 SUDO' if use_sudo else 'TERMINAL'
+        color = '#FF003C' if use_sudo else '#00e5ff'
+        rc_ok = rc == 0
+        hdr   = Gtk.Label()
+        hdr.set_markup(
+            f'<span foreground="{color}" size="small" weight="bold">{tag}</span>'
+            f'  <span foreground="{"#00e5ff" if rc_ok else "#FF003C"}" size="small">'
+            f'exit {rc}</span>')
+        hdr.set_halign(Gtk.Align.START)
+        content.pack_start(hdr, False, False, 0)
+
+        tv = Gtk.TextView()
+        tv.set_editable(False); tv.set_cursor_visible(False)
+        tv.set_wrap_mode(Gtk.WrapMode.WORD_CHAR)
+        tv.set_left_margin(10); tv.set_right_margin(10)
+        tv.set_top_margin(6);   tv.set_bottom_margin(6)
+        tv.get_style_context().add_class('terminal-tv')
+        tv.get_buffer().set_text(output[:4000])
+
+        frame = Gtk.Frame(); frame.set_shadow_type(Gtk.ShadowType.NONE)
+        frame.get_style_context().add_class('terminal-bubble')
+        frame.add(tv)
+        content.pack_start(frame, True, True, 0)
+
+        spacer = Gtk.Box(); spacer.set_size_request(60, -1)
+        outer.pack_start(content, True, True, 0)
+        outer.pack_start(spacer,  False, False, 0)
+        outer.show_all()
+        self._chat_box.pack_start(outer, False, False, 0)
+        self._scroll_end()
+
+        # Auto-enviar output a Claude para análisis
+        analysis_prompt = (
+            f'Ejecuté el comando: `{cmd}`\n'
+            f'Exit code: {rc}\n'
+            f'Output:\n```\n{output[:3000]}\n```\n\n'
+            f'{"¿Qué significa este error y cómo lo soluciono?" if rc != 0 else "¿Qué significa este output?"}'
+        )
+        self._typing_row, _ = _make_typing_indicator(self.cfg)
+        self._add_row(self._typing_row)
+        self._status.set_text('⚡ analizando output…')
+
+        threading.Thread(target=self._worker,
+                         args=(analysis_prompt, self.conv.session_id),
+                         daemon=True).start()
+        return False
+
+    def _show_no_cli(self):
+        row, _ = _make_message_row('assistant',
+            'No se encontró el CLI de claude.\n'
+            'Instala con: npm install -g @anthropic-ai/claude-code',
+            self.cfg, self._ai_pb, self._user_pb)
+        self._add_row(row)
+
+    # ── Barra de compactación ──────────────────────────────────────
+    def _show_compact_bar(self):
+        """Muestra barra cyberpunk de compactación sobre el área de chat."""
+        if hasattr(self, '_compact_bar_widget') and self._compact_bar_widget:
+            return  # ya visible
+
+        bar = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=2)
+        bar.get_style_context().add_class('compact-bar')
+
+        lbl = Gtk.Label()
+        lbl.get_style_context().add_class('compact-lbl')
+        lbl.set_markup('◈  COMPACTANDO MEMORIA NEURAL  ◈')
+        lbl.set_halign(Gtk.Align.CENTER)
+        bar.pack_start(lbl, False, False, 0)
+
+        # track (fondo) + fill (progreso animado)
+        track = Gtk.DrawingArea()
+        track.get_style_context().add_class('compact-track')
+        track.set_size_request(-1, 7)
+
+        self._compact_fill_w  = track
+        self._compact_phase   = 0.0   # 0.0–1.0 animado en loop
+        self._compact_dir     = 1
+        bar.pack_start(track, False, False, 0)
+
+        track.connect('draw', self._compact_draw)
+
+        # segunda fila: bloques parpadeantes
+        blk_box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=3)
+        blk_box.set_halign(Gtk.Align.CENTER)
+        self._compact_blocks = []
+        for _ in range(12):
+            b = Gtk.Label(label='█')
+            b.get_style_context().add_class('compact-lbl')
+            blk_box.pack_start(b, False, False, 0)
+            self._compact_blocks.append(b)
+        bar.pack_start(blk_box, False, False, 2)
+
+        self._compact_bar_widget = bar
+        # insertar al principio del chat_box
+        self._chat_box.pack_start(bar, False, False, 0)
+        self._chat_box.reorder_child(bar, 0)
+        bar.show_all()
+
+        self._compact_timer = GLib.timeout_add(60, self._compact_tick)
+        return False
+
+    def _compact_draw(self, widget, ctx):
+        """Cairo draw: barra de progreso bouncing."""
+        w = widget.get_allocated_width()
+        h = widget.get_allocated_height()
+        acc = self.cfg.get('accent', C_YELLOW).lstrip('#')
+        r = int(acc[0:2], 16) / 255
+        g = int(acc[2:4], 16) / 255
+        b = int(acc[4:6], 16) / 255
+        # fondo
+        ctx.set_source_rgba(r, g, b, 0.10)
+        ctx.rectangle(0, 0, w, h)
+        ctx.fill()
+        # bloque deslizante
+        fill_w = max(30, w // 3)
+        x = int(self._compact_phase * (w - fill_w))
+        ctx.set_source_rgba(r, g, b, 0.85)
+        ctx.rectangle(x, 0, fill_w, h)
+        ctx.fill()
+        # brillo
+        ctx.set_source_rgba(1, 1, 1, 0.25)
+        ctx.rectangle(x, 0, 4, h)
+        ctx.fill()
+
+    def _compact_tick(self):
+        if not hasattr(self, '_compact_bar_widget') or not self._compact_bar_widget:
+            return False
+        # animar barra bouncing
+        self._compact_phase += 0.035 * self._compact_dir
+        if self._compact_phase >= 1.0:
+            self._compact_phase = 1.0; self._compact_dir = -1
+        elif self._compact_phase <= 0.0:
+            self._compact_phase = 0.0; self._compact_dir = 1
+        if self._compact_fill_w:
+            self._compact_fill_w.queue_draw()
+        # bloques parpadeantes
+        for b in self._compact_blocks:
+            b.set_opacity(0.2 + random.random() * 0.8)
+        return True
+
+    def _hide_compact_bar(self):
+        if hasattr(self, '_compact_bar_widget') and self._compact_bar_widget:
+            self._chat_box.remove(self._compact_bar_widget)
+            self._compact_bar_widget = None
+        if hasattr(self, '_compact_timer') and self._compact_timer:
+            GLib.source_remove(self._compact_timer)
+            self._compact_timer = None
+        return False
+
+    # ── Historial ──────────────────────────────────────────────────
+    def _show_history(self, *_):
+        dlg = Gtk.Dialog(title='Historial', parent=self, modal=True)
+        dlg.set_default_size(440, 420)
+
+        # búsqueda
+        search_ent = Gtk.SearchEntry()
+        search_ent.set_placeholder_text('Buscar conversación…')
+        search_ent.set_margin_top(6); search_ent.set_margin_bottom(4)
+        search_ent.set_margin_start(10); search_ent.set_margin_end(10)
+        dlg.get_content_area().pack_start(search_ent, False, False, 0)
+
+        lb = Gtk.ListBox()
+        lb.set_selection_mode(Gtk.SelectionMode.SINGLE)
+
+        all_convs = [list(c.items()) for c in Conversation.list_all()]  # lista mutable
+
+        def _make_row(c: dict):
+            r = Gtk.ListBoxRow()
+            r.cid = c['id']
+            r.get_style_context().add_class('dlg-row')
+
+            # overlay para mostrar botones al hacer hover
+            overlay = Gtk.Overlay()
+            r.add(overlay)
+
+            # contenido principal
+            hb = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=0)
+            hb.set_margin_top(5); hb.set_margin_bottom(5)
+            hb.set_margin_start(10); hb.set_margin_end(6)
+
+            vb = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=2)
+            tl = Gtk.Label(label=c['title'][:58])
+            tl.get_style_context().add_class('dlg-title')
+            tl.set_halign(Gtk.Align.START)
+            tl.set_ellipsize(Pango.EllipsizeMode.END)
+            tl.set_max_width_chars(40)
+            dl = Gtk.Label(label=c['created'][:16].replace('T', '  '))
+            dl.get_style_context().add_class('dlg-sub')
+            dl.set_halign(Gtk.Align.START)
+            vb.pack_start(tl, False, False, 0)
+            vb.pack_start(dl, False, False, 0)
+            hb.pack_start(vb, True, True, 0)
+
+            # botones hover (ocultos por defecto)
+            btn_box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=4)
+            btn_box.set_valign(Gtk.Align.CENTER)
+            btn_box.set_halign(Gtk.Align.END)
+            btn_box.set_margin_end(8)
+            btn_box.set_no_show_all(True)
+
+            ren_btn = Gtk.Button(label='✎')
+            ren_btn.get_style_context().add_class('hist-action-btn')
+            ren_btn.set_tooltip_text('Renombrar')
+            del_btn = Gtk.Button(label='✕')
+            del_btn.get_style_context().add_class('hist-action-btn')
+            del_btn.get_style_context().add_class('hist-del-btn')
+            del_btn.set_tooltip_text('Eliminar')
+            btn_box.pack_start(ren_btn, False, False, 0)
+            btn_box.pack_start(del_btn, False, False, 0)
+
+            overlay.add(hb)
+            overlay.add_overlay(btn_box)
+            overlay.set_overlay_pass_through(btn_box, True)
+
+            # hover: mostrar / ocultar botones
+            def _enter(widget, event, bb=btn_box):
+                bb.show_all()
+            def _leave(widget, event, bb=btn_box):
+                # solo ocultar si el cursor salió del row completo
+                alloc = r.get_allocation()
+                if not (0 <= event.x <= alloc.width and 0 <= event.y <= alloc.height):
+                    bb.hide()
+
+            r.add_events(Gdk.EventMask.ENTER_NOTIFY_MASK | Gdk.EventMask.LEAVE_NOTIFY_MASK)
+            r.connect('enter-notify-event', _enter)
+            r.connect('leave-notify-event', _leave)
+
+            # renombrar
+            def _rename(btn, row=r, title_lbl=tl, cid=c['id']):
+                popup = Gtk.Dialog(title='Renombrar', parent=dlg, modal=True)
+                popup.set_default_size(340, 80)
+                ent = Gtk.Entry()
+                ent.set_text(title_lbl.get_text())
+                ent.set_margin_top(10); ent.set_margin_bottom(6)
+                ent.set_margin_start(12); ent.set_margin_end(12)
+                popup.get_content_area().pack_start(ent, False, False, 0)
+                popup.add_button('Guardar', Gtk.ResponseType.OK)
+                popup.add_button('Cancelar', Gtk.ResponseType.CANCEL)
+                popup.show_all()
+                ent.grab_focus()
+                ent.connect('activate', lambda e: popup.response(Gtk.ResponseType.OK))
+                if popup.run() == Gtk.ResponseType.OK:
+                    new_name = ent.get_text().strip()
+                    if new_name:
+                        Conversation.rename(cid, new_name)
+                        title_lbl.set_text(new_name[:58])
+                        # actualizar lista interna
+                        for entry in all_convs:
+                            d = dict(entry)
+                            if d.get('id') == cid:
+                                entry[:] = list({**d, 'title': new_name}.items())
+                popup.destroy()
+
+            ren_btn.connect('clicked', _rename)
+
+            # eliminar
+            def _delete(btn, row=r, cid=c['id']):
+                conf = Gtk.MessageDialog(
+                    parent=dlg, modal=True,
+                    message_type=Gtk.MessageType.WARNING,
+                    buttons=Gtk.ButtonsType.YES_NO,
+                    text='¿Eliminar esta conversación?')
+                conf.format_secondary_text(c['title'][:60])
+                resp = conf.run()
+                conf.destroy()
+                if resp == Gtk.ResponseType.YES:
+                    Conversation.delete(cid)
+                    lb.remove(row)
+                    lb.show_all()
+
+            del_btn.connect('clicked', _delete)
+
+            return r
+
+        all_convs_dicts = Conversation.list_all()
+
+        def _build_rows(convs):
+            for child in lb.get_children():
+                lb.remove(child)
+            for c in convs:
+                lb.add(_make_row(c))
+            lb.show_all()
+
+        def _on_search(entry):
+            q = entry.get_text().strip().lower()
+            filtered = [c for c in all_convs_dicts if q in c['title'].lower()] if q else all_convs_dicts
+            _build_rows(filtered)
+
+        search_ent.connect('search-changed', _on_search)
+        _build_rows(all_convs_dicts)
+
+        sc = Gtk.ScrolledWindow()
+        sc.set_vexpand(True)
+        sc.add(lb)
+        dlg.get_content_area().pack_start(sc, True, True, 4)
+        dlg.add_button('Abrir',    Gtk.ResponseType.OK)
+        dlg.add_button('Cancelar', Gtk.ResponseType.CANCEL)
+        dlg.show_all()
+
+        if dlg.run() == Gtk.ResponseType.OK:
+            sel = lb.get_selected_row()
+            if sel: self._load_conv(sel.cid)
+        dlg.destroy()
+
+    # ── Settings ───────────────────────────────────────────────────
+    def _show_settings(self, *_):
+        dlg = Gtk.Dialog(title='Configuración de Aurora', parent=self, modal=True)
+        dlg.set_default_size(500, 580)
+        nb = Gtk.Notebook()
+        nb.set_margin_top(6); nb.set_margin_bottom(6)
+        nb.set_margin_start(8); nb.set_margin_end(8)
+        dlg.get_content_area().pack_start(nb, True, True, 0)
+
+        def page(title):
+            box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=10)
+            box.set_margin_top(14); box.set_margin_bottom(14)
+            box.set_margin_start(14); box.set_margin_end(14)
+            lbl = Gtk.Label(label=title)
+            nb.append_page(box, lbl)
+            return box
+
+        def row(box, label_text, widget, hint=None):
+            vb = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=2)
+            lbl = Gtk.Label(label=label_text)
+            lbl.set_halign(Gtk.Align.START)
+            vb.pack_start(lbl, False, False, 0)
+            vb.pack_start(widget, False, False, 0)
+            if hint:
+                h = Gtk.Label()
+                h.set_markup(f'<small>{hint}</small>')
+                h.set_halign(Gtk.Align.START)
+                h.get_style_context().add_class('dlg-sub')
+                vb.pack_start(h, False, False, 0)
+            box.pack_start(vb, False, False, 0)
+
+        # ── Tab 1: Identidad ──────────────────────────────────
+        t1 = page('Identidad')
+
+        ai_name_e = Gtk.Entry()
+        ai_name_e.set_text(self.cfg.get('aurora_name', 'Aurora'))
+        row(t1, 'Nombre de Aurora:', ai_name_e)
+
+        user_name_e = Gtk.Entry()
+        user_name_e.set_text(self.cfg.get('user_name', 'Tú'))
+        row(t1, 'Tu nombre:', user_name_e)
+
+        t1.pack_start(Gtk.Separator(), False, False, 4)
+
+        # Avatar de Aurora
+        ai_av_box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
+        self._ai_prev = Gtk.Image.new_from_pixbuf(
+            _make_circular_pixbuf(self.cfg.get('aurora_avatar'), 40)
+            or _default_pixbuf(C_RED, 40, 'A'))
+        ai_av_box.pack_start(self._ai_prev, False, False, 0)
+        ai_av_btn = Gtk.Button(label='Cambiar avatar de Aurora')
+        ai_av_btn.get_style_context().add_class('aurora-btn-sm')
+        ai_av_btn.connect('clicked', lambda _: self._pick_avatar('aurora', dlg))
+        ai_av_box.pack_start(ai_av_btn, False, False, 0)
+        row(t1, 'Avatar de Aurora:', ai_av_box,
+            hint='PNG o SVG, se recortará en círculo')
+
+        # Avatar del usuario
+        usr_av_box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
+        user_av_path = self.cfg.get('user_avatar')
+        self._usr_prev = Gtk.Image.new_from_pixbuf(
+            _make_circular_pixbuf(user_av_path, 40)
+            if user_av_path else _default_pixbuf(C_YELLOW, 40,
+                self.cfg.get('user_name', 'Tú')[0].upper()))
+        usr_av_box.pack_start(self._usr_prev, False, False, 0)
+        usr_av_btn = Gtk.Button(label='Cambiar tu avatar')
+        usr_av_btn.get_style_context().add_class('aurora-btn-sm')
+        usr_av_btn.connect('clicked', lambda _: self._pick_avatar('user', dlg))
+        usr_av_box.pack_start(usr_av_btn, False, False, 0)
+        row(t1, 'Tu avatar:', usr_av_box)
+
+        # ── Tab 2: Personalidad ───────────────────────────────
+        t2 = page('Personalidad')
+        pers_lbl = Gtk.Label()
+        pers_lbl.set_markup(
+            '<small>Este texto se añade al system prompt de claude CLI '
+            'con <b>--append-system-prompt</b>.\n'
+            'Define cómo se comporta Aurora en cada respuesta.</small>')
+        pers_lbl.set_line_wrap(True)
+        pers_lbl.set_halign(Gtk.Align.START)
+        t2.pack_start(pers_lbl, False, False, 0)
+
+        pers_tv = Gtk.TextView()
+        pers_tv.set_wrap_mode(Gtk.WrapMode.WORD)
+        pers_tv.set_left_margin(8); pers_tv.set_right_margin(8)
+        pers_tv.set_top_margin(6);  pers_tv.set_bottom_margin(6)
+        pers_tv.get_style_context().add_class('aurora-input')
+        pers_buf = pers_tv.get_buffer()
+        pers_buf.set_text(self.cfg.get('personality', ''))
+        pers_sc = Gtk.ScrolledWindow()
+        pers_sc.set_vexpand(True)
+        pers_sc.add(pers_tv)
+        t2.pack_start(pers_sc, True, True, 0)
+
+        rst_btn = Gtk.Button(label='Restaurar personalidad por defecto')
+        rst_btn.get_style_context().add_class('aurora-btn-sm')
+        rst_btn.connect('clicked', lambda _: pers_buf.set_text(
+            DEFAULTS['personality']))
+        t2.pack_start(rst_btn, False, False, 0)
+
+        # ── Tab 3: Modelo ─────────────────────────────────────
+        t3 = page('Modelo')
+        cli_lbl = Gtk.Label()
+        cli_lbl.set_markup(
+            f'<small>CLI: <b>{CLAUDE_BIN or "no encontrado"}</b></small>')
+        cli_lbl.set_halign(Gtk.Align.START)
+        t3.pack_start(cli_lbl, False, False, 0)
+
+        models = ['', 'claude-opus-4-8', 'claude-sonnet-4-6',
+                  'claude-haiku-4-5-20251001', 'claude-opus-4-5']
+        model_cb = Gtk.ComboBoxText()
+        model_cb.append_text('(default del CLI)')
+        for m in models[1:]:
+            model_cb.append_text(m)
+        cur = self.cfg.get('model') or ''
+        idx = models.index(cur) if cur in models else 0
+        model_cb.set_active(idx)
+        row(t3, 'Modelo de Claude:',  model_cb,
+            hint='Vacío = usa el modelo activo en tu CLI')
+
+        # ── Tab 4: Apariencia ─────────────────────────────────
+        t4 = page('Apariencia')
+
+        accents = {'Amarillo cyberpunk': '#fcee09',
+                   'Rojo neón':          '#FF003C',
+                   'Cyan neón':          '#00e5ff',
+                   'Verde matrix':       '#00ff41',
+                   'Violeta':            '#bf5af2'}
+        acc_cb = Gtk.ComboBoxText()
+        cur_acc = self.cfg.get('accent', C_YELLOW)
+        for i, (name_k, val) in enumerate(accents.items()):
+            acc_cb.append_text(name_k)
+            if val == cur_acc: acc_cb.set_active(i)
+        if acc_cb.get_active() < 0: acc_cb.set_active(0)
+        row(t4, 'Color de acento:', acc_cb)
+
+        op_adj = Gtk.Adjustment(value=self.cfg.get('window_opacity', 90),
+                                lower=40, upper=100, step_increment=1)
+        op_scale = Gtk.Scale(orientation=Gtk.Orientation.HORIZONTAL,
+                             adjustment=op_adj)
+        op_scale.set_digits(0)
+        op_scale.set_hexpand(True)
+        row(t4, 'Opacidad de ventana (%):', op_scale,
+            hint='Menos = más transparente')
+
+        fs_adj = Gtk.Adjustment(value=self.cfg.get('font_size', 13),
+                                lower=10, upper=20, step_increment=1)
+        fs_scale = Gtk.Scale(orientation=Gtk.Orientation.HORIZONTAL,
+                             adjustment=fs_adj)
+        fs_scale.set_digits(0)
+        fs_scale.set_hexpand(True)
+        row(t4, 'Tamaño de fuente (px):', fs_scale)
+
+        sp_adj = Gtk.Adjustment(value=self.cfg.get('anim_speed', 4),
+                                lower=1, upper=20, step_increment=1)
+        sp_scale = Gtk.Scale(orientation=Gtk.Orientation.HORIZONTAL,
+                             adjustment=sp_adj)
+        sp_scale.set_digits(0)
+        sp_scale.set_hexpand(True)
+        row(t4, 'Velocidad de animación (chars/tick):', sp_scale,
+            hint='Más = más rápido')
+
+        ts_check = Gtk.CheckButton(label='Mostrar timestamp en mensajes')
+        ts_check.set_active(self.cfg.get('show_timestamp', True))
+        t4.pack_start(ts_check, False, False, 0)
+
+        # ── Tab 5: Cuentas ────────────────────────────────────
+        t5 = page('Cuentas')
+        accounts_list_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=0)
+
+        def refresh_accounts_ui():
+            for ch in accounts_list_box.get_children():
+                accounts_list_box.remove(ch)
+            accs = self.cfg.get('accounts', [])
+            if not accs:
+                accs = default_accounts()
+                self.cfg.set('accounts', accs)
+            now = datetime.now().timestamp()
+            cur = self.cfg.get('current_account_idx', 0) or 0
+
+            for i, ac in enumerate(accs):
+                creds = read_account_creds(ac.get('claude_dir', ''))
+                dep   = ac.get('depleted_until')
+                active_now = not (dep and now < dep)
+
+                row_box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=6)
+                row_box.set_margin_top(4); row_box.set_margin_bottom(4)
+                row_box.set_margin_start(4); row_box.set_margin_end(4)
+
+                # Indicador de estado
+                dot = Gtk.Label()
+                if i == cur:
+                    dot.set_markup('<span foreground="#fcee09">●</span>')
+                elif not active_now:
+                    dot.set_markup('<span foreground="#FF003C">●</span>')
+                elif not ac.get('enabled', True):
+                    dot.set_markup('<span foreground="#555">●</span>')
+                else:
+                    dot.set_markup('<span foreground="#00e5ff">●</span>')
+                row_box.pack_start(dot, False, False, 0)
+
+                # Info
+                vb2 = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=1)
+                name_lbl = Gtk.Label(label=ac.get('label', f'Cuenta {i+1}'))
+                name_lbl.get_style_context().add_class('dlg-title')
+                name_lbl.set_halign(Gtk.Align.START)
+                plan   = creds.get('plan', ac.get('plan', '?'))
+                status = ('activa' if active_now else
+                          f'agotada {int((dep - now)/60):.0f} min')
+                detail = f'{plan}  •  {status}'
+                if i == cur:
+                    detail += '  ★ en uso'
+                detail_lbl = Gtk.Label(label=detail)
+                detail_lbl.get_style_context().add_class('dlg-sub')
+                detail_lbl.set_halign(Gtk.Align.START)
+                vb2.pack_start(name_lbl,   False, False, 0)
+                vb2.pack_start(detail_lbl, False, False, 0)
+                row_box.pack_start(vb2, True, True, 0)
+
+                # Botones
+                if i != cur:
+                    use_btn = Gtk.Button(label='Usar')
+                    use_btn.get_style_context().add_class('aurora-btn-sm')
+                    use_btn._acc_idx = i
+                    def on_use(b, idx=i):
+                        self.cfg.set('current_account_idx', idx)
+                        refresh_accounts_ui()
+                    use_btn.connect('clicked', on_use)
+                    row_box.pack_start(use_btn, False, False, 0)
+
+                if dep and now < dep:
+                    rst_btn = Gtk.Button(label='Resetear')
+                    rst_btn.get_style_context().add_class('aurora-btn-sm')
+                    def on_reset(b, idx=i):
+                        accs2 = self.cfg.get('accounts', [])
+                        accs2[idx]['depleted_until'] = None
+                        self.cfg.save_all({'accounts': accs2})
+                        refresh_accounts_ui()
+                    rst_btn.connect('clicked', on_reset)
+                    row_box.pack_start(rst_btn, False, False, 0)
+
+                if i != 0 or len(accs) > 1:
+                    del_btn = Gtk.Button(label='✕')
+                    del_btn.get_style_context().add_class('aurora-btn-sm')
+                    def on_del(b, idx=i):
+                        accs2 = self.cfg.get('accounts', [])
+                        if len(accs2) > 1:
+                            accs2.pop(idx)
+                            cur2 = self.cfg.get('current_account_idx', 0) or 0
+                            if cur2 >= len(accs2):
+                                self.cfg.set('current_account_idx', 0)
+                            self.cfg.save_all({'accounts': accs2})
+                            refresh_accounts_ui()
+                    del_btn.connect('clicked', on_del)
+                    row_box.pack_start(del_btn, False, False, 0)
+
+                accounts_list_box.pack_start(row_box, False, False, 0)
+                accounts_list_box.pack_start(Gtk.Separator(), False, False, 0)
+
+            accounts_list_box.show_all()
+
+        refresh_accounts_ui()
+        t5.pack_start(accounts_list_box, False, False, 0)
+
+        # Auto-failover toggle
+        failover_check = Gtk.CheckButton(
+            label='Failover automático (cambiar cuenta si se agotan los tokens)')
+        failover_check.set_active(self.cfg.get('auto_failover', True))
+        t5.pack_start(failover_check, False, False, 6)
+
+        t5.pack_start(Gtk.Separator(), False, False, 4)
+
+        # Agregar nueva cuenta
+        add_lbl = Gtk.Label()
+        add_lbl.set_markup(
+            '<b>Agregar cuenta</b>\n'
+            '<small>Cada cuenta necesita su propio directorio de configuración.\n'
+            'Ejecuta el comando de abajo en una terminal para autenticar la nueva cuenta:</small>')
+        add_lbl.set_line_wrap(True); add_lbl.set_halign(Gtk.Align.START)
+        t5.pack_start(add_lbl, False, False, 0)
+
+        new_label_e = Gtk.Entry()
+        new_label_e.set_placeholder_text('Nombre para la nueva cuenta (ej. Trabajo)')
+        t5.pack_start(new_label_e, False, False, 4)
+
+        def _new_acc_dir():
+            n = len(self.cfg.get('accounts', []))
+            return str(ACCOUNTS_DIR / f'account{n+1}')
+
+        cmd_box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=4)
+        cmd_tv  = Gtk.Entry()
+        cmd_tv.set_editable(False)
+        cmd_tv.set_hexpand(True)
+        cmd_tv.set_text(f'CLAUDE_CONFIG_DIR={_new_acc_dir()} claude login')
+        copy_btn = Gtk.Button(label='Copiar')
+        copy_btn.get_style_context().add_class('aurora-btn-sm')
+        def on_copy(_):
+            clip = Gtk.Clipboard.get(Gdk.SELECTION_CLIPBOARD)
+            clip.set_text(cmd_tv.get_text(), -1)
+        copy_btn.connect('clicked', on_copy)
+        cmd_box.pack_start(cmd_tv,   True,  True,  0)
+        cmd_box.pack_start(copy_btn, False, False, 0)
+        t5.pack_start(cmd_box, False, False, 0)
+
+        verify_btn = Gtk.Button(label='✔ Verificar y agregar cuenta')
+        verify_btn.get_style_context().add_class('aurora-btn-sm')
+        verify_status = Gtk.Label(label='')
+        verify_status.get_style_context().add_class('dlg-sub')
+
+        def on_verify(_):
+            new_dir   = _new_acc_dir()
+            new_label = new_label_e.get_text().strip() or f'Cuenta {len(self.cfg.get("accounts",[]))+1}'
+            creds     = read_account_creds(new_dir)
+            if creds.get('valid'):
+                accs2 = self.cfg.get('accounts', [])
+                accs2.append({
+                    'id':            f'account{len(accs2)+1}',
+                    'label':         new_label,
+                    'claude_dir':    new_dir,
+                    'plan':          creds.get('plan', '?'),
+                    'enabled':       True,
+                    'depleted_until': None,
+                })
+                self.cfg.save_all({'accounts': accs2})
+                new_label_e.set_text('')
+                cmd_tv.set_text(f'CLAUDE_CONFIG_DIR={_new_acc_dir()} claude login')
+                verify_status.set_markup(
+                    f'<span foreground="#00e5ff">✔ Cuenta "{new_label}" agregada ({creds["plan"]})</span>')
+                refresh_accounts_ui()
+            else:
+                verify_status.set_markup(
+                    '<span foreground="#FF003C">✗ No se encontraron credenciales. '
+                    'Ejecuta el comando de arriba primero.</span>')
+
+        verify_btn.connect('clicked', on_verify)
+        t5.pack_start(verify_btn,    False, False, 4)
+        t5.pack_start(verify_status, False, False, 0)
+
+        # ── Tab 6: Sistema ────────────────────────────────────
+        t6 = page('Sistema')
+        hotkey_lbl = Gtk.Label()
+        hotkey_lbl.set_markup(
+            '<b>Hotkey global</b>\n'
+            '<small>Ctrl+Alt+Space — muestra/oculta Aurora desde cualquier app.</small>')
+        hotkey_lbl.set_line_wrap(True); hotkey_lbl.set_halign(Gtk.Align.START)
+        t6.pack_start(hotkey_lbl, False, False, 0)
+
+        hotkey_check = Gtk.CheckButton(label='Activar hotkey global (Ctrl+Alt+Space)')
+        hotkey_check.set_active(self.cfg.get('hotkey_enabled', True))
+        hotkey_check.set_tooltip_text(
+            'Requiere reiniciar Aurora para aplicar cambios')
+        t6.pack_start(hotkey_check, False, False, 4)
+
+        t6.pack_start(Gtk.Separator(), False, False, 6)
+
+        clip_lbl = Gtk.Label()
+        clip_lbl.set_markup(
+            '<b>Monitor de portapapeles</b>\n'
+            '<small>Detecta texto copiado y ofrece analizarlo con Aurora.</small>')
+        clip_lbl.set_line_wrap(True); clip_lbl.set_halign(Gtk.Align.START)
+        t6.pack_start(clip_lbl, False, False, 0)
+
+        clip_check = Gtk.CheckButton(label='Monitorear portapapeles')
+        clip_check.set_active(self.cfg.get('clipboard_monitor', True))
+        t6.pack_start(clip_check, False, False, 4)
+
+        clip_min_box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
+        clip_min_box.pack_start(Gtk.Label(label='Mínimo de caracteres:'), False, False, 0)
+        clip_spin = Gtk.SpinButton.new_with_range(20, 500, 10)
+        clip_spin.set_value(self.cfg.get('clipboard_min_chars', 80))
+        clip_min_box.pack_start(clip_spin, False, False, 0)
+        t6.pack_start(clip_min_box, False, False, 0)
+
+        t6.pack_start(Gtk.Separator(), False, False, 6)
+
+        shot_lbl = Gtk.Label()
+        shot_lbl.set_markup(
+            '<b>Captura de pantalla</b>\n'
+            '<small>Botón 📷 en el header captura la pantalla y la envía a Claude.</small>')
+        shot_lbl.set_line_wrap(True); shot_lbl.set_halign(Gtk.Align.START)
+        t6.pack_start(shot_lbl, False, False, 0)
+
+        t6.pack_start(Gtk.Separator(), False, False, 6)
+
+        dd_lbl = Gtk.Label()
+        dd_lbl.set_markup(
+            '<b>Drag &amp; Drop</b>\n'
+            '<small>Arrastra archivos al chat: código, PDFs, imágenes. '
+            'Máx. 3 archivos a la vez.</small>')
+        dd_lbl.set_line_wrap(True); dd_lbl.set_halign(Gtk.Align.START)
+        t6.pack_start(dd_lbl, False, False, 0)
+
+        dd_check = Gtk.CheckButton(label='Habilitar drag & drop de archivos')
+        dd_check.set_active(self.cfg.get('dragdrop_enabled', True))
+        t6.pack_start(dd_check, False, False, 4)
+
+        t6.pack_start(Gtk.Separator(), False, False, 6)
+
+        sysmon_check = Gtk.CheckButton(label='Mostrar stats de sistema en header (CPU, RAM, red)')
+        sysmon_check.set_active(self.cfg.get('show_sysmon', True))
+        t6.pack_start(sysmon_check, False, False, 0)
+
+        notif_check = Gtk.CheckButton(label='Notificaciones de escritorio')
+        notif_check.set_active(self.cfg.get('notifications', True))
+        t6.pack_start(notif_check, False, False, 0)
+
+        boot_check = Gtk.CheckButton(label='Animación de arranque cyberpunk (una vez al día)')
+        boot_check.set_active(self.cfg.get('boot_animation', True))
+        t6.pack_start(boot_check, False, False, 0)
+
+        dlg.add_button('Guardar', Gtk.ResponseType.OK)
+        dlg.add_button('Cancelar', Gtk.ResponseType.CANCEL)
+        dlg.show_all()
+
+        if dlg.run() == Gtk.ResponseType.OK:
+            acc_name = acc_cb.get_active_text()
+            new_acc  = accents.get(acc_name, C_YELLOW)
+            model_sel = model_cb.get_active()
+            model_val = '' if model_sel == 0 else models[model_sel]
+            self.cfg.save_all({
+                'aurora_name':         ai_name_e.get_text().strip() or 'Aurora',
+                'user_name':           user_name_e.get_text().strip() or 'Tú',
+                'personality':         pers_buf.get_text(
+                    pers_buf.get_start_iter(), pers_buf.get_end_iter(), False),
+                'model':               model_val or None,
+                'accent':              new_acc,
+                'window_opacity':      int(op_adj.get_value()),
+                'font_size':           int(fs_adj.get_value()),
+                'anim_speed':          int(sp_adj.get_value()),
+                'show_timestamp':      ts_check.get_active(),
+                'auto_failover':       failover_check.get_active(),
+                'hotkey_enabled':      hotkey_check.get_active(),
+                'clipboard_monitor':   clip_check.get_active(),
+                'clipboard_min_chars': int(clip_spin.get_value()),
+                'dragdrop_enabled':    dd_check.get_active(),
+                'show_sysmon':         sysmon_check.get_active(),
+                'notifications':       notif_check.get_active(),
+                'boot_animation':      boot_check.get_active(),
+            })
+            if hasattr(self, '_sysmon_bar'):
+                if self.cfg.get('show_sysmon', True):
+                    self._sysmon_bar.show_all()
+                else:
+                    self._sysmon_bar.hide()
+            self._ai_pb, self._user_pb = load_pixbufs(self.cfg)
+            self._reload_css()
+            self._update_title()
+
+        dlg.destroy()
+
+    def _pick_avatar(self, target: str, parent):
+        fc = Gtk.FileChooserDialog(
+            title='Selecciona imagen', parent=parent,
+            action=Gtk.FileChooserAction.OPEN)
+        fc.add_button('Cancelar', Gtk.ResponseType.CANCEL)
+        fc.add_button('Abrir',    Gtk.ResponseType.OK)
+        ff = Gtk.FileFilter()
+        ff.set_name('Imágenes (PNG, JPG, SVG)')
+        for p in ('image/png', 'image/jpeg', 'image/svg+xml'):
+            ff.add_mime_type(p)
+        fc.add_filter(ff)
+
+        if fc.run() == Gtk.ResponseType.OK:
+            path = fc.get_filename()
+            if target == 'aurora':
+                self.cfg.set('aurora_avatar', path)
+                pb = (_make_circular_pixbuf(path, 40)
+                      or _default_pixbuf(C_RED, 40, 'A'))
+                self._ai_prev.set_from_pixbuf(pb)
+            else:
+                self.cfg.set('user_avatar', path)
+                pb = (_make_circular_pixbuf(path, 40)
+                      or _default_pixbuf(C_YELLOW, 40, 'T'))
+                self._usr_prev.set_from_pixbuf(pb)
+        fc.destroy()
+
+    # ── Toggle ─────────────────────────────────────────────────────
+    def toggle(self):
+        if self.get_visible():
+            self.hide()
+        else:
+            self._position()
+            # Capturar fondo ANTES de mostrar la ventana (no aparece en screenshot)
+            x, y, w, h = self._window_rect()
+            threading.Thread(
+                target=self._capture_blur_bg, args=(x, y, w, h), daemon=True
+            ).start()
+            self.show_all()
+            self.present()
+            self._inp.grab_focus()
+
+
+# ══════════════════════════════════════════════════════════════════════
+#  App
+# ══════════════════════════════════════════════════════════════════════
+class Aurora:
+    def __init__(self):
+        self.cfg = Config()
+        self.win = AuroraWindow(self.cfg)
+        self._setup_indicator()
+
+    def _setup_indicator(self):
+        ICON.write_text(ICON_SVG)
+        if HAS_INDICATOR:
+            self.ind = AppIndicator3.Indicator.new(
+                'aurora-assistant', str(ICON),
+                AppIndicator3.IndicatorCategory.APPLICATION_STATUS)
+            self.ind.set_status(AppIndicator3.IndicatorStatus.ACTIVE)
+            self.ind.set_menu(self._menu())
+        else:
+            si = Gtk.StatusIcon()
+            try:
+                loader = GdkPixbuf.PixbufLoader.new_with_type('svg')
+                loader.write(ICON_SVG.encode())
+                loader.close()
+                pb = loader.get_pixbuf().scale_simple(
+                    22, 22, GdkPixbuf.InterpType.BILINEAR)
+                si.set_from_pixbuf(pb)
+            except:
+                si.set_from_icon_name('dialog-information',
+                                      Gtk.IconSize.SMALL_TOOLBAR)
+            si.set_tooltip_text('Aurora')
+            si.connect('activate', lambda _: self.win.toggle())
+            self._si = si
+
+    def _menu(self):
+        m = Gtk.Menu()
+        for lbl, fn in [
+            ('⚡  Aurora',       lambda _: self.win.toggle()),
+            ('＋  Nueva sesión', lambda _: (self.win.show_all(), self.win._new_conv())),
+            ('🕐  Historial',    lambda _: (self.win.show_all(), self.win._show_history())),
+            (None, None),
+            ('Salir', lambda _: Gtk.main_quit()),
+        ]:
+            if lbl is None: m.append(Gtk.SeparatorMenuItem())
+            else:
+                it = Gtk.MenuItem(label=lbl)
+                it.connect('activate', fn)
+                m.append(it)
+        m.show_all()
+        return m
+
+    def run(self):
+        if not CLAUDE_BIN:
+            d = Gtk.MessageDialog(parent=self.win, modal=True,
+                type=Gtk.MessageType.ERROR, buttons=Gtk.ButtonsType.OK,
+                text='CLI de Claude no encontrado',
+                secondary_text='npm install -g @anthropic-ai/claude-code')
+            d.run(); d.destroy()
+        Gtk.main()
+
+
+if __name__ == '__main__':
+    Aurora().run()

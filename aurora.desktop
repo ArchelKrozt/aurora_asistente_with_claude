@@ -1,0 +1,10 @@
+[Desktop Entry]
+Type=Application
+Name=Aurora
+Comment=Asistente IA Cyberpunk — integrada en la barra superior
+Exec=/home/sandokant/.local/share/aurora/venv/bin/python3 /home/sandokant/.local/bin/aurora
+Icon=/home/sandokant/.local/share/aurora/aurora.svg
+Hidden=false
+NoDisplay=false
+X-GNOME-Autostart-enabled=true
+StartupNotify=false
